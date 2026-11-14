@@ -1,0 +1,8 @@
+{
+  "active_model_id": "cybertiel-coder-35b-a3b",
+  "tunnel_url": "",
+  "tunnel_type": "cloudflare",
+  "idle_timeout_min": 20,
+  "max_runtime_min": 540,
+  "auto_wake": true
+}

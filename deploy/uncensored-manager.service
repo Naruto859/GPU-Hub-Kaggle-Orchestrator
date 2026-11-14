@@ -1,0 +1,19 @@
+[Unit]
+Description=GPU Hub Kaggle Orchestrator and OpenAI/Anthropic Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/gpu-hub
+ExecStart=/opt/gpu-hub/.venv/bin/python /opt/gpu-hub/app.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

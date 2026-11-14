@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Builds and packages
+build/
+dist/
+*.egg-info/
+
+# Runtime secrets and credentials
+.env
+.env.*
+!.env.example
+.kaggle/
+kaggle.json
+accounts.json
+kaggle_accounts.json
+client_secret.json
+webshare_secret.json
+webshare_token.json
+
+# Runtime controller state and private registries
+config.json
+state.json
+usage_ledger.json
+custom_models.json
+webshare_state.json
+
+# Generated kernel artifacts, downloads, and logs
+kernel_output/
+stop_bundle/
+runtime_bundles/
+*.log
+logs/
+*.tmp
+*.bak
+*.bak-*
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

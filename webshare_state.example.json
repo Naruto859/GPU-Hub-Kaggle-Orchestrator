@@ -1,0 +1,9 @@
+{
+  "connected": false,
+  "auto_refresh": true,
+  "refresh_month": "YYYY-MM",
+  "refreshes_used": 0,
+  "proxies": [],
+  "last_exit_ip": "",
+  "last_error": ""
+}

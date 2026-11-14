@@ -1,0 +1,1855 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>GPU Hub · Kaggle GPU &amp; TPU Controller</title>
+  <meta name="theme-color" content="#06080f" />
+  <meta name="description" content="Autonomous Kaggle GPU and TPU controller with permanent OpenAI and Anthropic client endpoints." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: ['class', '[data-theme="dark"]'],
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace']
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* ── SynthiQ Design Tokens ─────────────────────────────── */
+    :root, [data-theme="dark"] {
+      --bg: #06080f;
+      --surface: #0b0f1a;
+      --surface-2: #111726;
+      --surface-3: #161e30;
+      --line: #1c2436;
+      --line-soft: #161d2c;
+      --line-strong: #253048;
+      --text: #e8edf7;
+      --muted: #8794ad;
+      --faint: #5c6883;
+      --accent: #22d3ee;
+      --accent-deep: #06b6d4;
+      --accent-ring: #0891b2;
+      --accent-2: #6366f1;
+      --on-accent: #041016;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --bad: #fb7185;
+      --glow: rgba(34,211,238,0.35);
+      --shadow: rgba(0,0,0,0.5);
+      color-scheme: dark;
+    }
+
+    [data-theme="light"] {
+      --bg: #f6f8fc;
+      --surface: #ffffff;
+      --surface-2: #eef2f9;
+      --surface-3: #e3e9f4;
+      --line: #d5dcea;
+      --line-soft: #e4e9f2;
+      --line-strong: #b9c4d8;
+      --text: #101725;
+      --muted: #55617a;
+      --faint: #7b869d;
+      --accent: #0e7490;
+      --accent-deep: #0891b2;
+      --accent-ring: #155e75;
+      --accent-2: #4f46e5;
+      --on-accent: #ffffff;
+      --ok: #047857;
+      --warn: #a16207;
+      --bad: #be123c;
+      --glow: rgba(14,116,144,0.28);
+      --shadow: rgba(16,23,37,0.18);
+      color-scheme: light;
+    }
+
+    * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+      min-height: 100vh;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+
+    /* Cards & Containers */
+    .syn-card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      transition: border-color 0.15s ease, background 0.2s ease;
+    }
+    @media (max-width: 640px) {
+      .syn-card { padding: 13px; }
+    }
+    .syn-card:hover {
+      border-color: var(--line-strong);
+    }
+
+    /* Inputs */
+    .syn-input {
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 13px;
+      outline: none;
+      transition: all 0.15s ease;
+      width: 100%;
+    }
+    .syn-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(34,211,238,0.15);
+    }
+
+    /* Buttons */
+    .syn-btn-primary {
+      background: var(--accent);
+      color: var(--on-accent);
+      font-weight: 600;
+      border-radius: 8px;
+      padding: 9px 16px;
+      font-size: 13px;
+      transition: all 0.15s ease;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border: none;
+    }
+    .syn-btn-primary:hover {
+      opacity: 0.92;
+      box-shadow: 0 0 14px var(--glow);
+    }
+    .syn-btn-primary:active { transform: scale(0.98); }
+    .syn-btn-secondary {
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      color: var(--text);
+      font-weight: 500;
+      border-radius: 8px;
+      padding: 9px 14px;
+      font-size: 13px;
+      transition: all 0.15s ease;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+    .syn-btn-secondary:hover {
+      border-color: var(--line-strong);
+      background: var(--surface-3);
+    }
+    .syn-btn-secondary:active { transform: scale(0.98); }
+    .account-action-grid button { min-height: 34px; width: 100%; line-height: 1.15; }
+
+    /* Pills & Badges */
+    .pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .pill-ok { background: rgba(52,211,153,0.12); color: var(--ok); border: 1px solid rgba(52,211,153,0.25); }
+    .pill-warn { background: rgba(251,191,36,0.12); color: var(--warn); border: 1px solid rgba(251,191,36,0.25); }
+    .pill-bad { background: rgba(251,113,133,0.12); color: var(--bad); border: 1px solid rgba(251,113,133,0.25); }
+    .pill-info { background: rgba(34,211,238,0.12); color: var(--accent); border: 1px solid rgba(34,211,238,0.25); }
+    .pill-neutral { background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); }
+
+    /* Theme Switch (SynthiQ Original) */
+    .theme-switch {
+      position: relative; display: inline-flex; padding: 2px; gap: 2px;
+      background: var(--surface-2); border: 1px solid var(--line);
+      border-radius: 999px; flex-shrink: 0;
+    }
+    .theme-switch button {
+      position: relative; z-index: 1; width: 28px; height: 24px;
+      display: grid; place-items: center; border: 0; background: transparent;
+      color: var(--faint); cursor: pointer; border-radius: 999px;
+      transition: color 0.18s;
+    }
+    .theme-switch button[aria-pressed="true"] { color: var(--on-accent); }
+    .theme-switch .thumb {
+      position: absolute; top: 2px; left: 2px; width: 28px; height: 24px;
+      border-radius: 999px; background: var(--accent);
+      transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .theme-switch[data-pos="light"] .thumb { transform: translateX(30px); }
+    .theme-switch .ico { width: 13px; height: 13px; }
+
+    /* Custom Dropdown Selector (Zero Chrome native picker) */
+    .custom-dropdown {
+      position: relative;
+      width: 100%;
+    }
+    .custom-dropdown-btn {
+      width: 100%;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 13px;
+      text-align: left;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .custom-dropdown-btn:hover, .custom-dropdown.open .custom-dropdown-btn {
+      border-color: var(--accent);
+    }
+    .custom-dropdown-menu {
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      box-shadow: 0 12px 28px -6px var(--shadow);
+      z-index: 50;
+      max-height: 420px;
+      overflow-y: auto;
+      display: none;
+      padding: 4px;
+    }
+    .custom-dropdown.open .custom-dropdown-menu {
+      display: block;
+    }
+    .custom-dropdown-item {
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12.5px;
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      transition: background 0.12s ease;
+    }
+    .custom-dropdown-item:hover {
+      background: var(--surface-2);
+    }
+    .custom-dropdown-item.active {
+      background: var(--surface-3);
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    /* Terminal Log Box */
+    .log-box {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      background: #04060b;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      color: #94a3b8;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    [data-theme="light"] .log-box {
+      background: #f1f4f9;
+      color: #334155;
+    }
+    .log-box::-webkit-scrollbar { width: 4px; }
+    .log-box::-webkit-scrollbar-track { background: transparent; }
+    .log-box::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+
+    /* Stop Button (SynthiQ Red/Amber accent) */
+    .syn-btn-stop {
+      background: rgba(251, 113, 133, 0.12);
+      border: 1px solid rgba(251, 113, 133, 0.35);
+      color: var(--bad);
+      font-weight: 600;
+      border-radius: 8px;
+      padding: 9px 14px;
+      font-size: 13px;
+      transition: all 0.15s ease;
+      cursor: pointer;
+    }
+    .syn-btn-stop:hover:not(:disabled) {
+      background: rgba(251, 113, 133, 0.22);
+      border-color: var(--bad);
+      box-shadow: 0 0 12px rgba(251, 113, 133, 0.25);
+    }
+    .syn-btn-stop:active:not(:disabled) { transform: scale(0.98); }
+    .syn-btn-stop:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+      border-color: var(--line);
+      color: var(--muted);
+      background: var(--surface-2);
+      box-shadow: none;
+    }
+
+    /* Output Box with Clean Adaptive Theme */
+    .syn-output-box {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      line-height: 1.5;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      color: var(--text);
+      max-height: 144px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    }
+
+    /* Bottom Specs / Memory Bar */
+    .syn-specs-bar {
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px 16px;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+
+    /* Model Cards Grid */
+    .syn-model-card {
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      transition: all 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .syn-model-card:hover {
+      border-color: var(--line-strong);
+      transform: translateY(-1px);
+    }
+    .syn-model-card.selected {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .syn-model-card.running {
+      border-color: var(--ok);
+      box-shadow: 0 0 0 1px var(--ok);
+    }
+  </style>
+</head>
+<body class="p-3 sm:p-6 max-w-7xl mx-auto">
+
+  <!-- Header -->
+  <header class="flex flex-col sm:flex-row items-start sm:items-center justify-between pb-4 mb-4 border-b border-[var(--line)] gap-3">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-[var(--surface-2)] border border-[var(--line)] flex items-center justify-center text-[var(--accent)]">
+        <!-- Server / Chip SVG -->
+        <svg class="w-5 h-5 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+          <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+          <rect x="9" y="9" width="6" height="6"></rect>
+          <line x1="9" y1="1" x2="9" y2="4"></line>
+          <line x1="15" y1="1" x2="15" y2="4"></line>
+          <line x1="9" y1="20" x2="9" y2="23"></line>
+          <line x1="15" y1="20" x2="15" y2="23"></line>
+          <line x1="20" y1="9" x2="23" y2="9"></line>
+          <line x1="20" y1="14" x2="23" y2="14"></line>
+          <line x1="1" y1="9" x2="4" y2="9"></line>
+          <line x1="1" y1="14" x2="4" y2="14"></line>
+        </svg>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="text-base sm:text-lg font-bold tracking-tight text-[var(--text)]">GPU Hub</h1>
+          <span class="pill pill-info text-[10px]">T4 + TPU</span>
+        </div>
+        <p class="text-xs text-[var(--muted)]">Autonomous Kaggle GPU / TPU Controller</p>
+      </div>
+    </div>
+
+    <!-- Right Header: Badges & Theme Toggle -->
+    <div class="flex items-center gap-2 flex-wrap">
+      <div id="statusBadge" class="pill pill-warn">
+        <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
+        <span id="statusText">CONNECTING</span>
+      </div>
+      <div class="pill pill-neutral font-mono text-[11px]" id="elapsedBadge">0s</div>
+
+      <!-- Theme Switch (SynthiQ Light / Dark) -->
+      <div class="theme-switch" id="themeSwitch" data-pos="dark" role="group" aria-label="Colour theme">
+        <span class="thumb" aria-hidden="true"></span>
+        <button type="button" onclick="setTheme('dark')" aria-pressed="true" aria-label="Dark theme" title="Dark theme">
+          <svg class="ico stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg>
+        </button>
+        <button type="button" onclick="setTheme('light')" aria-pressed="false" aria-label="Light theme" title="Light theme">
+          <svg class="ico stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        </button>
+      </div>
+
+      <button onclick="toggleMockMode()" id="mockToggleBtn" class="syn-btn-secondary py-1 px-2.5 text-xs">
+        <span>Mock: <span id="mockStateText" class="text-[var(--muted)]">OFF</span></span>
+      </button>
+      <button onclick="fetchStatus()" class="syn-btn-secondary py-1 px-2.5 text-xs" title="Refresh">
+        <svg class="w-3.5 h-3.5 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Error/Alert Banner -->
+  <div id="statusDetailBanner" class="hidden mb-3 p-2.5 rounded-lg border text-xs flex items-center justify-between"></div>
+  <div id="warmupBanner" class="hidden mb-3 p-3 rounded-lg border border-amber-400/30 bg-amber-400/10 text-xs">
+    <div class="flex items-center justify-between gap-2">
+      <span id="warmupTitle" class="font-semibold text-[var(--warn)]">WARMING UP</span>
+      <span id="warmupMaxEta" class="pill pill-warn text-[9px]">MAX 15M</span>
+    </div>
+    <div id="warmupProgressText" class="font-mono text-[11px] text-[var(--text)] mt-1"></div>
+    <div class="h-1.5 bg-[var(--surface-3)] rounded-full mt-2 overflow-hidden">
+      <div id="warmupProgressBar" class="h-full bg-[var(--warn)] rounded-full transition-all duration-1000" style="width:0%"></div>
+    </div>
+  </div>
+
+  <!-- Main Grid -->
+  <main class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+    <!-- Column 1: Model Specs & Lifecycle -->
+    <div class="space-y-4">
+
+      <!-- Card: Model Selector & Launch -->
+      <section class="syn-card">
+        <div class="flex items-center justify-between mb-2.5">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider flex items-center gap-1.5">
+            <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            GPU Lifecycle
+          </h2>
+          <span id="rankBadge" class="pill pill-info text-[10px]">Rank 1</span>
+        </div>
+
+        <div class="space-y-3">
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Target Model (Custom Selector)</label>
+            <!-- Custom Dropdown Component -->
+            <div class="custom-dropdown" id="modelDropdownWrap">
+              <button type="button" class="custom-dropdown-btn" onclick="toggleDropdown('modelDropdownWrap')">
+                <span id="modelDropdownLabel" class="truncate font-medium">CyberTiel-Coder-35B-A3B (Abliterated MoE)</span>
+                <svg class="w-4 h-4 stroke-current ml-1 flex-shrink-0" fill="none" stroke-width="2" viewBox="0 0 24 24">
+                  <polyline points="6 9 12 15 18 9"></polyline>
+                </svg>
+              </button>
+              <div class="custom-dropdown-menu" id="modelDropdownMenu">
+                <!-- Items populated dynamically -->
+              </div>
+            </div>
+            <input type="hidden" id="modelSelectVal" value="cybertiel-coder-35b-a3b" />
+          </div>
+
+          <details class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)]">
+            <summary class="text-[11px] font-semibold cursor-pointer text-[var(--accent)]">+ Add Custom Open-Source Model (Hugging Face GGUF)</summary>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+              <input id="customModelName" class="syn-input text-xs" placeholder="Model Name" />
+              <input id="customModelRepo" class="syn-input text-xs font-mono" placeholder="org/repository" />
+              <input id="customModelFilename" class="syn-input text-xs font-mono" placeholder="model-Q4_K_M.gguf" />
+              <input id="customModelContext" type="number" min="2048" max="262144" value="32768" class="syn-input text-xs font-mono" placeholder="Context Window" />
+            </div>
+            <button onclick="saveCustomModel(this)" class="syn-btn-secondary w-full text-xs mt-2">Save Custom Model</button>
+          </details>
+
+          <!-- Specs List -->
+          <div class="bg-[var(--surface-2)] border border-[var(--line)] rounded-lg p-2.5 space-y-1.5 text-xs">
+            <div class="flex justify-between">
+              <span class="text-[var(--muted)]">Parameters</span>
+              <span id="specParams" class="font-medium text-[var(--text)]">35B MoE (~3.4B active)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-[var(--muted)]">Quantization</span>
+              <span id="specQuant" class="font-medium text-[var(--text)]">UD-Q4_K_XL (Cyber-imatrix)</span>
+            </div>
+            <div class="flex justify-between">
+              <span id="specMemoryLabel" class="text-[var(--muted)]">VRAM Demand</span>
+              <span id="specVram" class="font-medium text-[var(--text)]">24.8 GB / 32 GB (Dual T4)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-[var(--muted)]">Context Window</span>
+              <span id="specContext" class="font-mono text-[var(--accent)] font-semibold">262,144 tokens (262k / ~2.75 lakh)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-[var(--muted)]">RoPE Scaling</span>
+              <span id="specRope" class="font-mono text-[var(--accent)] font-medium">YaRN scale 8 (orig 32k)</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-[var(--muted)]">KV Cache Quant</span>
+              <span id="specKvCache" class="font-mono text-[var(--text)] font-medium">q4_0 / q4_0</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-[var(--muted)]">Est. Speed</span>
+              <span id="specSpeed" class="font-medium text-[var(--ok)]">40-55 tok/s (MoE Dual T4)</span>
+            </div>
+          </div>
+
+          <div class="pt-1 flex gap-2">
+            <button onclick="launchKernel()" id="launchBtn" class="syn-btn-primary flex-1">
+              <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span id="launchBtnText">Launch Model</span>
+            </button>
+            <button onclick="stopKernel()" id="stopBtn" class="syn-btn-stop px-3 flex items-center justify-center gap-1.5" title="Stop Session & Release Kaggle GPU Quota" disabled>
+              <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+                <rect x="5" y="5" width="14" height="14" rx="2" ry="2"></rect>
+              </svg>
+              <span id="stopBtnText">Stop GPU Session</span>
+            </button>
+            <button onclick="resetKernel()" id="resetBtn" class="syn-btn-secondary px-3" title="Reset State">
+              <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+                <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
+                <path d="M21 3v5h-5"></path>
+                <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path>
+                <path d="M8 16H3v5"></path>
+              </svg>
+            </button>
+          </div>
+          <div id="lifecycleWarmupBox" class="hidden rounded-lg border border-amber-400/30 bg-amber-400/10 p-2.5">
+            <div id="lifecycleWarmupPhase" class="text-[11px] font-semibold text-[var(--warn)]">1/4 Pushing Kernel</div>
+            <div id="lifecycleWarmupTime" class="text-[10px] font-mono text-[var(--text)] mt-1">Elapsed: 00m 00s | Est. Remaining: ~00m 00s (Max 15m)</div>
+            <div class="h-1 bg-[var(--surface-3)] rounded-full mt-2 overflow-hidden"><div id="lifecycleWarmupBar" class="h-full bg-[var(--warn)] transition-all duration-1000" style="width:0%"></div></div>
+          </div>
+          <button onclick="triggerPrewarm(this)" id="prewarmBtn" class="syn-btn-secondary w-full text-xs" title="Start Tunnel B now on the next verified key">Pre-Warm Next Verified Key</button>
+
+          <div class="pt-1">
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1" for="idleTimeoutInput">Auto-shutdown idle timeout (minutes)</label>
+            <div class="flex gap-2">
+              <input type="number" id="idleTimeoutInput" class="syn-input font-mono text-xs" min="0" max="10080" step="1" value="20" title="0 = never auto-close on idle; max 10080 minutes (7 days)" />
+              <button onclick="saveAutoShutdownSettings()" class="syn-btn-secondary text-xs px-3 whitespace-nowrap" title="Save auto-shutdown timers (applies on next launch)">Save</button>
+            </div>
+            <p class="text-[10px] text-[var(--muted)] mt-1 leading-relaxed">Kernel self-terminates after this many idle minutes, releasing the Kaggle slot. 0 = Never; maximum 10080 minutes (7 days). Applied on next launch.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Card: Permanent Client API -->
+      <section class="syn-card border-[var(--accent-ring)]/50">
+        <div class="flex items-center justify-between mb-2.5 gap-2">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider">Client API Endpoint &amp; Key</h2>
+          <span class="pill pill-info text-[10px]">OpenCode / Agents</span>
+        </div>
+        <div class="space-y-2.5">
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Permanent Base URL</label>
+            <div class="flex gap-2">
+              <input id="clientBaseUrl" class="syn-input font-mono text-xs" readonly />
+              <button onclick="copyField('clientBaseUrl', this)" class="syn-btn-secondary px-3 text-xs">Copy</button>
+            </div>
+          </div>
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Chat Completions URL</label>
+            <div class="flex gap-2">
+              <input id="clientChatUrl" class="syn-input font-mono text-xs" readonly />
+              <button onclick="copyField('clientChatUrl', this)" class="syn-btn-secondary px-3 text-xs">Copy</button>
+            </div>
+          </div>
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Client API Key / Bearer Token</label>
+            <div class="flex gap-2 flex-wrap sm:flex-nowrap">
+              <input type="password" id="clientApiKey" class="syn-input font-mono text-xs min-w-0" autocomplete="off" />
+              <button onclick="toggleClientKey(this)" class="syn-btn-secondary px-3 text-xs">Show</button>
+              <button onclick="copyField('clientApiKey', this)" class="syn-btn-secondary px-3 text-xs">Copy</button>
+              <button onclick="saveClientConfig(this)" class="syn-btn-primary px-3 text-xs">Save</button>
+            </div>
+          </div>
+          <label class="flex items-center gap-2 text-[11px] text-[var(--muted)] cursor-pointer">
+            <input id="autoWakeToggle" type="checkbox" class="accent-cyan-400" checked />
+            Auto-wake a stopped accelerator when an inference request arrives (waits up to 10 minutes).
+          </label>
+          <p class="text-[10px] text-[var(--muted)] leading-relaxed">Use <span class="font-mono">Authorization: Bearer &lt;key&gt;</span>. The Base URL stays fixed while GPU Hub re-links changing Cloudflare tunnels.</p>
+        </div>
+      </section>
+
+      <!-- Card: Upstream Tunnel -->
+      <section class="syn-card">
+        <div class="flex items-center justify-between mb-2.5">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider flex items-center gap-1.5">
+            <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="2" y1="12" x2="22" y2="12"></line>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </svg>
+            Cloudflare Upstream
+          </h2>
+          <span id="tunnelStatusPill" class="pill pill-neutral text-[10px]">DISCONNECTED</span>
+        </div>
+
+        <div class="space-y-2.5">
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Active Tunnel Endpoint</label>
+            <div class="flex gap-2">
+              <input type="text" id="tunnelUrlInput" class="syn-input font-mono text-xs" readonly placeholder="Waiting for kernel tunnel..." />
+              <button onclick="copyTunnelUrl()" class="syn-btn-secondary px-3" title="Copy">
+                <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Manual Override URL</label>
+            <div class="flex gap-2">
+              <input type="text" id="manualTunnelInput" class="syn-input font-mono text-xs" placeholder="https://xyz.trycloudflare.com" />
+              <button onclick="overrideTunnel()" class="syn-btn-secondary text-xs px-3 whitespace-nowrap">Apply</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- Column 2: Credentials & Test Inference -->
+    <div class="space-y-4">
+
+      <!-- Card: Kaggle Multi-Account Pool -->
+      <section class="syn-card">
+        <div class="flex items-center justify-between mb-2.5">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider flex items-center gap-1.5">
+            <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+              <path d="M21 2l-2 2m-2-2l2 2m7 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"></path>
+            </svg>
+            Kaggle Key Pool &amp; Network Proxy
+          </h2>
+          <span id="credsBadge" class="pill pill-ok text-[10px]">Synced</span>
+        </div>
+
+        <div class="space-y-3">
+          <div class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)] space-y-2">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-[11px] font-semibold text-[var(--text)]">Webshare Anti-Ban Proxy Shield</span>
+              <span id="webshareBadge" class="pill pill-neutral text-[9px]">DISCONNECTED</span>
+            </div>
+            <div class="flex gap-2">
+              <input type="password" id="webshareToken" class="syn-input text-xs font-mono" placeholder="Webshare API token" autocomplete="off" />
+              <button onclick="connectWebshare(this)" class="syn-btn-secondary text-[10px] px-2.5 whitespace-nowrap">Connect Webshare</button>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div class="text-[10px] font-mono bg-[var(--surface)] border border-[var(--line)] rounded p-2">
+                Exit IP: <span id="webshareExitIp" class="text-[var(--accent)]">—</span>
+              </div>
+              <div class="text-[10px] font-mono bg-[var(--surface)] border border-[var(--line)] rounded p-2">
+                Refreshes: <span id="webshareRefreshUsage" class="text-[var(--text)]">0 / 250 used</span>
+              </div>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <label class="flex items-center gap-2 text-[10px] text-[var(--muted)] cursor-pointer leading-tight">
+                <input id="webshareAutoRefresh" type="checkbox" class="accent-cyan-400" onchange="setWebshareAutoRefresh(this.checked)" checked />
+                Auto-Refresh IP on account switch &amp; 15-min pre-warm (Zero IP Leak)
+              </label>
+              <button id="webshareRefreshBtn" onclick="refreshWebshareIp(this)" class="syn-btn-secondary py-1.5 px-2 text-[10px] whitespace-nowrap" disabled>Refresh IP Now</button>
+            </div>
+            <div id="webshareError" class="hidden text-[10px] text-[var(--bad)]"></div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <input type="text" id="kaggleUsername" class="syn-input text-xs" placeholder="Kaggle username (optional · auto-detected)" autocomplete="off" />
+            <input type="password" id="kaggleKey" class="syn-input text-xs" placeholder="Kaggle API key / KGAT token" autocomplete="off" oninput="scheduleKaggleUsernameDetection()" />
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <select id="accountProxyType" class="syn-input text-xs" onchange="toggleAccountProxy()">
+              <option value="server">Server Direct (VPS network)</option>
+              <option value="webshare">Webshare Auto-Rotate (Zero Leak)</option>
+              <option value="custom">Custom HTTP / SOCKS5 proxy</option>
+            </select>
+            <input type="text" id="accountProxyUrl" class="syn-input text-xs font-mono hidden" placeholder="http://user:pass@host:port" />
+          </div>
+          <button onclick="addKaggleAccount(this)" class="syn-btn-secondary w-full text-xs">Add Account to Queue</button>
+
+          <details class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)]">
+            <summary class="text-[11px] font-medium cursor-pointer text-[var(--muted)]">Bulk paste username:key or kaggle.json</summary>
+            <textarea id="kaggleBulkInput" rows="3" class="syn-input font-mono text-[11px] mt-2 resize-y" placeholder='personal_token_one_per_line\nfriend1:legacy_key\n{"username":"friend2","key":"personal_access_token"}'></textarea>
+            <button onclick="bulkAddKaggleAccounts(this)" class="syn-btn-secondary w-full text-xs mt-2">Import Accounts</button>
+          </details>
+
+          <div>
+            <div class="flex items-center justify-between mb-1.5">
+              <span class="text-[11px] font-medium text-[var(--muted)]">Friends' Keys Queue</span>
+              <span id="accountCount" class="text-[10px] font-mono text-[var(--muted)]">0 accounts</span>
+            </div>
+            <div id="kaggleAccountsList" class="space-y-2">
+              <div class="text-[11px] text-[var(--muted)] border border-dashed border-[var(--line)] rounded-lg p-3">No saved accounts.</div>
+            </div>
+          </div>
+          <p class="text-[10px] text-[var(--muted)] leading-relaxed">Keys are verified immediately. GPU Hub pre-warms the next VERIFIED · READY account 15 minutes before a session or weekly quota limit, swaps tunnels atomically, and resets exhausted weekly ledgers after seven days.</p>
+        </div>
+      </section>
+
+      <!-- Card: Instant Inference Tester -->
+      <section class="syn-card">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider flex items-center gap-1.5">
+            <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="16" y1="13" x2="8" y2="13"></line>
+              <line x1="16" y1="17" x2="8" y2="17"></line>
+            </svg>
+            Inference &amp; Refusal Tester
+          </h2>
+          <span class="text-[10px] text-[var(--muted)]">Zero-Filter Verification</span>
+        </div>
+
+        <div class="space-y-2">
+          <textarea id="promptInput" rows="3" class="syn-input font-mono text-xs resize-none" placeholder="Write a memory inspection / cybersecurity analysis script..."></textarea>
+
+          <div class="flex items-center justify-between">
+            <span id="testLatency" class="text-[11px] font-mono text-[var(--muted)]">Latency: -</span>
+            <button onclick="runInferenceTest()" id="sendTestBtn" class="syn-btn-primary py-1.5 px-3 text-xs">
+              <svg class="w-3.5 h-3.5 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+              <span>Execute</span>
+            </button>
+          </div>
+
+          <div id="testOutputBox" class="syn-output-box">Awaiting prompt submission...</div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- Column 3: Event Console & Live Logs (Tight Clean Spacing) -->
+    <div class="space-y-4">
+      <section class="syn-card flex flex-col h-full min-h-[460px]">
+        <div class="flex items-center justify-between mb-1.5 pb-1 border-b border-[var(--line)]">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider flex items-center gap-1.5">
+            <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+              <polyline points="4 17 10 11 4 5"></polyline>
+              <line x1="12" y1="19" x2="20" y2="19"></line>
+            </svg>
+            Event Console
+          </h2>
+          <button onclick="clearLogs()" class="syn-btn-secondary py-0.5 px-2 text-[10px]" title="Clear Console & Server Logs">
+            <svg class="w-3 h-3 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            Clear
+          </button>
+        </div>
+
+        <div id="logConsole" class="log-box flex-1 mt-1">
+          [00:00:00] Initializing GPU Hub client...
+        </div>
+
+        <div class="mt-2.5 pt-2 border-t border-[var(--line)] flex items-center justify-between text-[11px] text-[var(--muted)]">
+          <span>Bridge: <span class="font-mono text-[var(--text)]">127.0.0.1:8776</span></span>
+          <span>Gateway: <span class="font-mono text-[var(--ok)]">Connected</span></span>
+        </div>
+      </section>
+    </div>
+
+  </main>
+
+  <!-- Bottom Specs & Memory Bar -->
+  <footer class="syn-specs-bar mt-4">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+      <div class="flex items-center gap-3 flex-wrap">
+        <div class="flex items-center gap-2">
+          <span class="w-2 h-2 rounded-full bg-[var(--ok)]"></span>
+          <span id="bottomHardwareName" class="font-semibold text-[var(--text)]">Dual Tesla T4</span>
+          <span id="bottomHardwareDetail" class="text-[var(--muted)] font-mono">(32 GB GDDR6 &middot; PCIe 3.0 x16)</span>
+        </div>
+        <span class="text-[var(--line-strong)] hidden sm:inline">&vert;</span>
+        <div class="flex items-center gap-1.5">
+          <span id="bottomMemoryLabel" class="text-[var(--muted)]">VRAM Pool:</span>
+          <span id="bottomVramDemand" class="font-mono text-[var(--accent)] font-medium">24.8 GB / 32 GB</span>
+        </div>
+        <span class="text-[var(--line-strong)] hidden sm:inline">&vert;</span>
+        <div class="flex items-center gap-1.5">
+          <span class="text-[var(--muted)]">Context Window:</span>
+          <span id="bottomContextLength" class="font-mono text-[var(--accent)] font-semibold">262,144 tokens (YaRN scale 8)</span>
+        </div>
+        <span class="text-[var(--line-strong)] hidden sm:inline">&vert;</span>
+        <div class="flex items-center gap-1.5">
+          <span class="text-[var(--muted)]">KV Cache:</span>
+          <span id="bottomKvCache" class="font-mono text-[var(--text)] font-medium">q4_0 / q4_0 (-np 1 single slot)</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 text-[var(--muted)] text-[11px] font-mono">
+        <span>Runtime: <span id="bottomRuntime" class="text-[var(--text)]">llama.cpp · -sm layer · -ts 1,1</span></span>
+        <span>&middot;</span>
+        <span>Bridge: <span class="text-[var(--text)]">8776</span></span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Script logic -->
+  <script>
+    // ── Global State & Timer ────────────────────────────────────
+    let activeState = null;
+    let modelSpecs = {};
+    let webshareState = {connected: false, auto_refresh: true, refreshes_used: 0, refresh_limit: 250};
+    let launchEpochMs = null;
+    let isEngineActive = false;
+    let currentSelectedModelId = '';
+    let currentWarmup = null;
+    let usernameDetectTimer = null;
+
+    function formatElapsed(totalSec) {
+      if (totalSec < 0) totalSec = 0;
+      const h = Math.floor(totalSec / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      if (h > 0) {
+        return `${h}h ${m}m ${s}s`;
+      } else if (m > 0) {
+        return `${m}m ${s}s`;
+      } else {
+        return `${s}s`;
+      }
+    }
+
+    function tickLiveTimer() {
+      const badge = document.getElementById('elapsedBadge');
+      if (!badge) return;
+      if (!isEngineActive || !launchEpochMs) {
+        badge.innerText = '0s';
+        return;
+      }
+      const now = Date.now();
+      const elapsedSec = Math.floor((now - launchEpochMs) / 1000);
+      badge.innerText = formatElapsed(elapsedSec);
+      tickWarmupBanner();
+    }
+
+    function shortTime(seconds) {
+      seconds = Math.max(0, Math.round(seconds || 0));
+      const m = Math.floor(seconds / 60);
+      const s = seconds % 60;
+      return `${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+    }
+
+    function tickWarmupBanner() {
+      const banner = document.getElementById('warmupBanner');
+      const lifecycleBox = document.getElementById('lifecycleWarmupBox');
+      if (!banner || !currentWarmup) {
+        if (banner) banner.classList.add('hidden');
+        if (lifecycleBox) lifecycleBox.classList.add('hidden');
+        return;
+      }
+      const elapsed = Math.max(0, (Date.now() / 1000) - currentWarmup.launch_time);
+      const estimate = currentWarmup.estimated_total_seconds || 570;
+      const remaining = Math.max(0, estimate - elapsed);
+      const maxRemaining = Math.max(0, 900 - elapsed);
+      const accountNumber = currentWarmup.queue_position ? `KEY #${currentWarmup.queue_position}` : 'KEY';
+      const roleLabel = currentWarmup.role === 'prewarm' ? 'PRE-WARMING' : (currentWarmup.role === 'test' ? 'TESTING BOOT' : 'WARMING UP');
+      document.getElementById('warmupTitle').innerText = `${roleLabel} ${accountNumber} (${currentWarmup.username || 'Kaggle'})`;
+      document.getElementById('warmupProgressText').innerText = `Elapsed: ${shortTime(elapsed)} | Est. Remaining: ~${shortTime(remaining)} | Max Remaining: ${shortTime(maxRemaining)}`;
+      document.getElementById('warmupProgressBar').style.width = `${Math.min(100, (elapsed / Math.max(estimate, 1)) * 100)}%`;
+      const warning = elapsed > 900;
+      document.getElementById('warmupMaxEta').innerText = warning ? 'ETA EXCEEDED' : 'MAX 15M';
+      document.getElementById('warmupMaxEta').className = `pill ${warning ? 'pill-bad' : 'pill-warn'} text-[9px]`;
+      const phases = {
+        initializing: '1/4 Pushing Kernel', pushing: '1/4 Pushing Kernel',
+        queued: '2/4 Kaggle Provisioning',
+        booting: '3/4 Loading Model Weights', loading_model: '3/4 Loading Model Weights',
+        health_check: '4/4 Opening Cloudflare Tunnel & Health Check', eta_warning: '4/4 Opening Cloudflare Tunnel & Health Check',
+        cooldown: 'Safety Cooldown Before Same-Key Restart'
+      };
+      document.getElementById('lifecycleWarmupPhase').innerText = phases[currentWarmup.status] || '2/4 Kaggle Provisioning';
+      document.getElementById('lifecycleWarmupTime').innerText = `Elapsed: ${shortTime(elapsed)} | Est. Remaining: ~${shortTime(remaining)} (Max 15m)`;
+      document.getElementById('lifecycleWarmupBar').style.width = `${Math.min(100, (elapsed / Math.max(estimate, 1)) * 100)}%`;
+      lifecycleBox.classList.remove('hidden');
+      banner.classList.remove('hidden');
+    }
+
+    // ── SynthiQ Theme Handling ──────────────────────────────────
+    function setTheme(name) {
+      const theme = name === 'light' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', theme);
+      localStorage.setItem('uncensored_theme', theme);
+
+      const sw = document.getElementById('themeSwitch');
+      if (sw) {
+        sw.dataset.pos = theme;
+        sw.querySelectorAll('button').forEach((b, i) =>
+          b.setAttribute('aria-pressed', (i === 0) === (theme === 'dark') ? 'true' : 'false'));
+      }
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) {
+        meta.content = theme === 'dark' ? '#06080f' : '#f6f8fc';
+      }
+    }
+
+    // Init saved theme
+    const savedTheme = localStorage.getItem('uncensored_theme') || 'dark';
+    setTheme(savedTheme);
+
+    // ── Custom Dropdown Logic ───────────────────────────────────
+    function toggleDropdown(id) {
+      const el = document.getElementById(id);
+      const isOpen = el.classList.contains('open');
+      document.querySelectorAll('.custom-dropdown').forEach(d => d.classList.remove('open'));
+      if (!isOpen) el.classList.add('open');
+    }
+
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.custom-dropdown')) {
+        document.querySelectorAll('.custom-dropdown').forEach(d => d.classList.remove('open'));
+      }
+    });
+
+    function selectModelOption(id, name) {
+      currentSelectedModelId = id;
+      document.getElementById('modelSelectVal').value = id;
+      document.getElementById('modelDropdownLabel').innerText = name;
+      document.getElementById('modelDropdownWrap').classList.remove('open');
+
+      document.querySelectorAll('#modelDropdownMenu .custom-dropdown-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.id === id);
+      });
+
+      updateSpecDetails(id);
+      if (activeState) {
+        updateLaunchAndStopButtons(activeState);
+        renderModelCards(activeState);
+      }
+      fetch('/api/model/select', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({model_id: id})
+      });
+    }
+
+    function toggleAccountProxy() {
+      const custom = document.getElementById('accountProxyType').value === 'custom';
+      document.getElementById('accountProxyUrl').classList.toggle('hidden', !custom);
+    }
+
+    async function copyField(id, button) {
+      const value = document.getElementById(id).value;
+      if (!value) return;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const helper = document.createElement('textarea');
+          helper.value = value;
+          helper.style.position = 'fixed';
+          helper.style.opacity = '0';
+          document.body.appendChild(helper);
+          helper.select();
+          document.execCommand('copy');
+          helper.remove();
+        }
+      } catch (error) {
+        console.error('Copy failed:', error);
+        return;
+      }
+      if (button) {
+        const old = button.innerText;
+        button.innerText = 'Copied';
+        setTimeout(() => button.innerText = old, 1200);
+      }
+    }
+
+    function toggleClientKey(button) {
+      const input = document.getElementById('clientApiKey');
+      const showing = input.type === 'text';
+      input.type = showing ? 'password' : 'text';
+      button.innerText = showing ? 'Show' : 'Hide';
+    }
+
+    async function loadClientConfig() {
+      const origin = window.location.origin;
+      document.getElementById('clientBaseUrl').value = `${origin}/v1`;
+      document.getElementById('clientChatUrl').value = `${origin}/v1/chat/completions`;
+      try {
+        const response = await fetch('/api/client-config', {cache: 'no-store'});
+        const data = await response.json();
+        document.getElementById('clientApiKey').value = data.api_key || '';
+        document.getElementById('autoWakeToggle').checked = data.auto_wake !== false;
+      } catch (error) {
+        console.error('Client config load failed:', error);
+      }
+    }
+
+    async function saveClientConfig(button) {
+      const apiKey = document.getElementById('clientApiKey').value.trim();
+      const autoWake = document.getElementById('autoWakeToggle').checked;
+      const old = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Saving...';
+      try {
+        const response = await fetch('/api/client-config', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({api_key: apiKey, auto_wake: autoWake})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Save failed');
+        document.getElementById('clientApiKey').value = data.api_key;
+        button.innerText = 'Saved';
+      } catch (error) {
+        button.innerText = 'Error';
+        console.error(error);
+      } finally {
+        setTimeout(() => { button.innerText = old; button.disabled = false; }, 1400);
+      }
+    }
+
+    function updateLaunchAndStopButtons(data) {
+      const launchBtn = document.getElementById('launchBtn');
+      const launchBtnText = document.getElementById('launchBtnText');
+      const stopBtn = document.getElementById('stopBtn');
+      const prewarmBtn = document.getElementById('prewarmBtn');
+
+      const status = (data.status || 'idle').toLowerCase();
+      const isRunning = (status === 'ready' || status === 'running');
+      const isDeploying = (status === 'initializing' || status === 'downloading' || status === 'loading_vram' || status === 'warming');
+      const isSelectedModelRunning = isRunning && (currentSelectedModelId === data.active_model_id);
+
+      // Stop button: enabled in EVERY non-idle state. Even on error a Kaggle
+      // session may still be alive burning GPU quota — Stop must always be
+      // reachable so Boss can release the batch-session slot.
+      if (stopBtn) {
+        stopBtn.disabled = (status === 'idle');
+      }
+      if (prewarmBtn) {
+        prewarmBtn.disabled = !isRunning || Boolean(data.warming_session);
+        prewarmBtn.innerText = data.warming_session ? 'Tunnel B Is Warming' : 'Pre-Warm Next Verified Key';
+      }
+
+      // Launch button state
+      if (launchBtn && launchBtnText) {
+        if (isDeploying) {
+          launchBtn.disabled = true;
+          launchBtn.classList.add('opacity-50', 'cursor-not-allowed');
+          launchBtnText.innerText = 'Deploying...';
+        } else if (isSelectedModelRunning) {
+          launchBtn.disabled = true;
+          launchBtn.classList.add('opacity-50', 'cursor-not-allowed');
+          launchBtnText.innerText = 'Active (Running)';
+        } else {
+          launchBtn.disabled = false;
+          launchBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+          launchBtnText.innerText = 'Launch Model';
+        }
+      }
+    }
+
+    function renderModelCards(data) {
+      const grid = document.getElementById('availableModelsGrid');
+      if (!grid || !data.available_models) return;
+
+      const status = (data.status || 'idle').toLowerCase();
+      const isRunning = (status === 'ready' || status === 'running');
+
+      let html = '';
+      data.available_models.forEach(m => {
+        modelSpecs[m.id] = m;
+        const isThisRunning = isRunning && (m.id === data.active_model_id);
+        const isSelected = (m.id === currentSelectedModelId);
+
+        let cardClass = 'syn-model-card';
+        if (isThisRunning) cardClass += ' running';
+        else if (isSelected) cardClass += ' selected';
+
+        let badgeHtml = '';
+        if (isThisRunning) {
+          badgeHtml = '<span class="pill pill-ok text-[10px]"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>Running</span>';
+        } else if (isSelected) {
+          badgeHtml = '<span class="pill pill-info text-[10px]">Selected</span>';
+        } else {
+          badgeHtml = '<span class="pill pill-neutral text-[10px]">Standby</span>';
+        }
+
+        let actionBtnHtml = '';
+        if (isThisRunning) {
+          actionBtnHtml = `<button class="syn-btn-secondary w-full text-xs py-1.5 opacity-50 cursor-not-allowed font-medium" disabled title="Model is currently active and running on Kaggle">Running</button>`;
+        } else if (isSelected) {
+          actionBtnHtml = `<button onclick="launchKernel()" class="syn-btn-primary w-full text-xs py-1.5 font-semibold cursor-pointer" title="Launch ${escapeHtml(m.name)} on Kaggle">Launch Model</button>`;
+        } else {
+          actionBtnHtml = `<button onclick="selectModelOption('${m.id}', '${escapeHtml(m.name)}')" class="syn-btn-secondary w-full text-xs py-1.5 font-medium cursor-pointer hover:border-[var(--accent)]">Select Model</button>`;
+        }
+
+        const ctx = m.context_display || (m.context_length ? (m.context_length.toLocaleString() + ' tok') : '32k');
+
+        html += `
+          <div class="${cardClass}" onclick="if(!event.target.closest('button')) selectModelOption('${m.id}', '${escapeHtml(m.name)}')">
+            <div>
+              <div class="flex items-start justify-between gap-1.5 mb-1.5">
+                <span class="font-semibold text-xs text-[var(--text)] leading-tight">${escapeHtml(m.name)}</span>
+                <div class="flex items-center gap-1 shrink-0">
+                  <span class="pill pill-neutral text-[9px] font-mono">Rank ${m.rank || '-'}</span>
+                  ${badgeHtml}
+                </div>
+              </div>
+              <p class="text-[11px] text-[var(--muted)] mb-2.5 line-clamp-2 leading-relaxed">${escapeHtml(m.description || m.parameters)}</p>
+              <div class="space-y-1 text-[11px] bg-[var(--surface)] p-2 rounded border border-[var(--line)] mb-3">
+                <div class="flex justify-between">
+                  <span class="text-[var(--muted)]">Params:</span>
+                  <span class="font-mono text-[var(--text)]">${escapeHtml(m.parameters || '-')}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-[var(--muted)]">Quant / VRAM:</span>
+                  <span class="font-mono text-[var(--text)]">${escapeHtml(m.quant || '-')} &middot; ${escapeHtml(m.vram_requirement || '-')}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-[var(--muted)]">Context:</span>
+                  <span class="font-mono text-[var(--accent)] font-semibold">${escapeHtml(ctx)}</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-[var(--muted)]">Est. Speed:</span>
+                  <span class="font-mono text-[var(--ok)]">${escapeHtml(m.speed || '-')}</span>
+                </div>
+              </div>
+            </div>
+            <div class="pt-1">
+              ${actionBtnHtml}
+            </div>
+          </div>
+        `;
+      });
+
+      grid.innerHTML = html;
+    }
+
+    // ── Status & State ──────────────────────────────────────────
+    function updateStatusUI(data) {
+      activeState = data;
+      const status = (data.status || 'IDLE').toUpperCase();
+      const badge = document.getElementById('statusBadge');
+      const text = document.getElementById('statusText');
+      text.innerText = status;
+
+      badge.className = 'pill';
+      if (status === 'READY') {
+        badge.classList.add('pill-ok');
+      } else if (status === 'ERROR') {
+        badge.classList.add('pill-bad');
+      } else if (status === 'INITIALIZING' || status === 'DOWNLOADING' || status === 'LOADING_VRAM' || status === 'WARMING') {
+        badge.classList.add('pill-warn');
+      } else {
+        badge.classList.add('pill-neutral');
+      }
+
+      // Sync live timer epoch
+      const st = (data.status || 'IDLE').toLowerCase();
+      const active = !['idle', 'error', 'quota_wait'].includes(st);
+      let serverEpochMs = null;
+      if (data.launch_timestamp !== undefined && data.launch_timestamp !== null) {
+        serverEpochMs = data.launch_timestamp * 1000;
+      } else if (Number(data.elapsed_seconds) > 0) {
+        serverEpochMs = Date.now() - (Number(data.elapsed_seconds) * 1000);
+      }
+      isEngineActive = active && serverEpochMs !== null;
+      if (isEngineActive) {
+        if (launchEpochMs === null || Math.abs(launchEpochMs - serverEpochMs) > 5000) {
+          launchEpochMs = serverEpochMs;
+        }
+      } else {
+        launchEpochMs = null;
+      }
+      tickLiveTimer();
+      currentWarmup = data.warmup || null;
+      if (currentWarmup && data.kaggle_accounts) {
+        const warmAccount = data.kaggle_accounts.find(account => account.id === currentWarmup.account_id);
+        if (warmAccount) currentWarmup.queue_position = warmAccount.queue_position;
+      }
+      tickWarmupBanner();
+
+      // Status banner update
+      const banner = document.getElementById('statusDetailBanner');
+      if (banner) {
+        if (st === 'error' && data.status_detail) {
+          banner.className = 'mb-3 p-2.5 rounded-lg border border-red-500/30 bg-red-950/20 text-red-300 text-xs flex items-center gap-2';
+          banner.innerHTML = `<svg class="w-4 h-4 stroke-current flex-shrink-0" fill="none" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg><span>${escapeHtml(data.status_detail)}</span>`;
+        } else if (data.prewarm_warning) {
+          banner.className = 'mb-3 p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-[var(--warn)] text-xs flex items-center gap-2';
+          banner.innerHTML = `<span>Pre-warm warning: ${escapeHtml(data.prewarm_warning)}</span>`;
+        } else {
+          banner.className = 'hidden';
+        }
+      }
+
+      // Upstream Tunnel
+      const tunnel = data.tunnel_url || '';
+      document.getElementById('tunnelUrlInput').value = tunnel;
+      const tPill = document.getElementById('tunnelStatusPill');
+      if (tunnel && status === 'READY') {
+        tPill.innerText = 'CONNECTED';
+        tPill.className = 'pill pill-ok text-[10px]';
+      } else {
+        tPill.innerText = 'DISCONNECTED';
+        tPill.className = 'pill pill-neutral text-[10px]';
+      }
+
+      // Mock
+      document.getElementById('mockStateText').innerText = data.mock_mode ? 'ON' : 'OFF';
+      document.getElementById('mockStateText').className = data.mock_mode ? 'text-[var(--ok)] font-semibold' : 'text-[var(--muted)]';
+
+      // Auto-shutdown idle timeout (only sync when input is not focused, so
+      // server-side polling never clobbers what the user is typing)
+      const idleInput = document.getElementById('idleTimeoutInput');
+      if (idleInput && document.activeElement !== idleInput && data.idle_timeout_min !== undefined) {
+        idleInput.value = data.idle_timeout_min;
+      }
+
+      if (data.kaggle_accounts) {
+        renderKaggleAccounts(data.kaggle_accounts);
+      }
+
+      // Populate Model Dropdown once
+      if (data.available_models) {
+        const menu = document.getElementById('modelDropdownMenu');
+        let html = '';
+        data.available_models.forEach(m => {
+          modelSpecs[m.id] = m;
+          const isActive = m.id === currentSelectedModelId;
+          const ctxDisplay = m.context_display || ((m.context_length || 32768).toLocaleString() + ' tok');
+          html += `
+            <div class="custom-dropdown-item ${isActive ? 'active' : ''}" data-id="${m.id}" onclick="selectModelOption('${m.id}', '${m.name}')">
+              <div class="flex justify-between items-center">
+                <span class="font-medium">${m.name}</span>
+                <span class="text-[10px] text-[var(--accent)] font-mono">Rank ${m.rank || '-'} &middot; ${ctxDisplay}</span>
+              </div>
+              <span class="text-[10.5px] text-[var(--muted)] truncate">${m.description || m.parameters}</span>
+            </div>
+          `;
+        });
+        menu.innerHTML = html;
+      }
+
+      if (data.active_model_id && !currentSelectedModelId) {
+        currentSelectedModelId = data.active_model_id;
+      }
+
+      if (currentSelectedModelId) {
+        document.getElementById('modelSelectVal').value = currentSelectedModelId;
+        const currentSpec = modelSpecs[currentSelectedModelId] || modelSpecs[data.active_model_id];
+        if (currentSpec) {
+          document.getElementById('modelDropdownLabel').innerText = currentSpec.name;
+        }
+        updateSpecDetails(currentSelectedModelId);
+      }
+
+      // Update buttons and model cards
+      updateLaunchAndStopButtons(data);
+      renderModelCards(data);
+
+      // Logs
+      if (data.recent_logs && data.recent_logs.length > 0) {
+        const consoleEl = document.getElementById('logConsole');
+        consoleEl.innerHTML = data.recent_logs.map(l => `<div>${escapeHtml(l)}</div>`).join('');
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      }
+    }
+
+    function updateSpecDetails(modelId) {
+      const spec = modelSpecs[modelId];
+      if (!spec) return;
+      if (document.getElementById('rankBadge')) {
+        document.getElementById('rankBadge').innerText = 'Rank ' + (spec.rank || 1);
+      }
+      document.getElementById('specParams').innerText = spec.parameters || '-';
+      document.getElementById('specQuant').innerText = spec.quant || '-';
+      document.getElementById('specVram').innerText = spec.vram_requirement || '-';
+      const isTpu = spec.accelerator === 'tpu';
+      document.getElementById('specMemoryLabel').innerText = isTpu ? 'TPU Memory' : 'VRAM Demand';
+      document.getElementById('specContext').innerText = spec.context_display || ((spec.context_length || 32768).toLocaleString() + ' tokens (' + Math.round((spec.context_length || 32768)/1000) + 'k)');
+      if (document.getElementById('specRope')) {
+        document.getElementById('specRope').innerText = spec.rope_scaling || 'Standard / None';
+      }
+      if (document.getElementById('specKvCache')) {
+        document.getElementById('specKvCache').innerText = spec.kv_cache || 'q4_0 / q4_0';
+      }
+      document.getElementById('specSpeed').innerText = spec.speed || '-';
+
+      // Update Bottom Specs Bar
+      if (document.getElementById('bottomVramDemand')) {
+        document.getElementById('bottomVramDemand').innerText = spec.vram_requirement || '24.8 GB / 32 GB';
+      }
+      document.getElementById('bottomMemoryLabel').innerText = isTpu ? 'TPU Memory:' : 'VRAM Pool:';
+      document.getElementById('bottomHardwareName').innerText = spec.hardware || (isTpu ? 'Kaggle TPU v5e-8' : 'Dual Tesla T4');
+      document.getElementById('bottomHardwareDetail').innerText = `(${spec.hardware_detail || ''})`;
+      document.getElementById('bottomRuntime').innerText = spec.runtime || '-';
+      if (document.getElementById('bottomContextLength')) {
+        document.getElementById('bottomContextLength').innerText = spec.context_display || ((spec.context_length || 32768).toLocaleString() + ' tokens');
+      }
+      if (document.getElementById('bottomKvCache')) {
+        document.getElementById('bottomKvCache').innerText = spec.kv_cache || 'q4_0 / q4_0';
+      }
+    }
+
+    async function saveCustomModel(button) {
+      const payload = {
+        name: document.getElementById('customModelName').value.trim(),
+        repo_id: document.getElementById('customModelRepo').value.trim(),
+        filename: document.getElementById('customModelFilename').value.trim(),
+        context_length: Number(document.getElementById('customModelContext').value || 32768)
+      };
+      const original = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Saving...';
+      try {
+        const response = await fetch('/api/models/custom', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Custom model save failed');
+        modelSpecs[data.model.id] = data.model;
+        selectModelOption(data.model.id, data.model.name);
+        button.innerText = 'Saved';
+        await fetchStatus();
+      } catch (error) {
+        button.innerText = 'Error';
+        console.error(error);
+      } finally {
+        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1500);
+      }
+    }
+
+    async function launchKernel() {
+      const id = currentSelectedModelId || document.getElementById('modelSelectVal').value;
+      const btn = document.getElementById('launchBtn');
+      const txt = document.getElementById('launchBtnText');
+      txt.innerText = 'Deploying...';
+      btn.disabled = true;
+      btn.classList.add('opacity-50', 'cursor-not-allowed');
+      try {
+        const res = await fetch('/api/kaggle/launch', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({model_id: id})
+        });
+        const d = await res.json();
+        await fetchStatus();
+      } catch (e) {
+        console.error('Launch failed:', e);
+      } finally {
+        if (activeState) updateLaunchAndStopButtons(activeState);
+      }
+    }
+
+    async function saveAutoShutdownSettings() {
+      const input = document.getElementById('idleTimeoutInput');
+      const btn = event && event.target ? event.target : null;
+      const raw = parseFloat(input.value);
+      if (isNaN(raw) || raw < 0 || raw > 10080) {
+        input.classList.add('border-red-500/60');
+        return;
+      }
+      input.classList.remove('border-red-500/60');
+      if (btn) { btn.disabled = true; btn.innerText = 'Saving...'; }
+      try {
+        const res = await fetch('/api/kernel/settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ idle_timeout_min: raw })
+        });
+        const d = await res.json();
+        if (d.success) {
+          input.value = d.idle_timeout_min;
+          if (btn) { btn.innerText = 'Saved'; }
+          setTimeout(() => { if (btn) { btn.innerText = 'Save'; btn.disabled = false; } }, 1500);
+        } else {
+          if (btn) { btn.innerText = 'Save'; btn.disabled = false; }
+        }
+      } catch (e) {
+        console.error('Save auto-shutdown settings failed:', e);
+        if (btn) { btn.innerText = 'Save'; btn.disabled = false; }
+      }
+    }
+
+    async function stopKernel() {
+      const btn = document.getElementById('stopBtn');
+      const txt = document.getElementById('stopBtnText');
+      txt.innerText = 'Stopping...';
+      btn.disabled = true;
+      btn.classList.add('opacity-50', 'cursor-not-allowed');
+      try {
+        const res = await fetch('/api/kernel/stop', { method: 'POST' });
+        const d = await res.json();
+        await fetchStatus();
+      } catch (e) {
+        console.error('Stop failed:', e);
+      } finally {
+        txt.innerText = 'Stop GPU Session';
+      }
+    }
+
+    async function resetKernel() {
+      const btn = document.getElementById('resetBtn');
+      if (btn) btn.classList.add('animate-spin');
+      try {
+        await fetch('/api/kernel/reset', { method: 'POST' });
+        await fetchStatus();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        if (btn) btn.classList.remove('animate-spin');
+      }
+    }
+
+    async function overrideTunnel() {
+      const url = document.getElementById('manualTunnelInput').value.trim();
+      if (!url) return;
+      await fetch('/api/tunnel/override', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tunnel_url: url})
+      });
+      fetchStatus();
+    }
+
+    async function toggleMockMode() {
+      const current = activeState.mock_mode || false;
+      await fetch('/api/mock_mode/toggle', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: !current})
+      });
+      fetchStatus();
+    }
+
+    function accountStatusClass(status) {
+      if (status === 'ACTIVE' || status === 'HOT_STANDBY') return 'pill-ok';
+      if (status === 'VERIFIED_READY') return 'pill-info';
+      if (status === 'COOLDOWN' || status === 'VERIFYING' || status === 'PREWARMING' || status === 'TESTING_BOOT') return 'pill-warn';
+      return 'pill-bad';
+    }
+
+    function renderKaggleAccounts(accounts) {
+      const list = document.getElementById('kaggleAccountsList');
+      document.getElementById('accountCount').innerText = `${accounts.length} account${accounts.length === 1 ? '' : 's'}`;
+      if (!accounts.length) {
+        list.innerHTML = '<div class="text-[11px] text-[var(--muted)] border border-dashed border-[var(--line)] rounded-lg p-3">No saved accounts.</div>';
+        return;
+      }
+      list.innerHTML = accounts.map(account => `
+        <div class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)]">
+          <div class="flex items-start justify-between gap-2">
+            <div class="min-w-0">
+              <div class="text-xs font-semibold truncate">${escapeHtml(account.username)}</div>
+              <div class="text-[10px] font-mono text-[var(--muted)] truncate">${escapeHtml(account.key_hint || 'Key present')} · ${escapeHtml(account.proxy || 'server')}</div>
+              <div class="text-[10px] font-mono text-[var(--muted)] truncate">Exit IP: <span class="text-[var(--accent)]">${escapeHtml(account.last_exit_ip || 'not verified')}</span></div>
+            </div>
+            <span class="pill ${accountStatusClass(account.status)} text-[9px] shrink-0">${escapeHtml(account.status_display || account.status)}</span>
+          </div>
+          <div class="grid grid-cols-2 gap-1.5 mt-2 text-[10px] font-mono">
+            <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-1.5">
+              <div class="text-[var(--muted)]">GPU WEEK</div>
+              <div class="text-[var(--text)]">${Number(account.gpu_quota?.used_hours || 0).toFixed(2)}h / ${account.gpu_quota?.limit_hours || 30}h</div>
+            </div>
+            <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-1.5">
+              <div class="text-[var(--muted)]">TPU WEEK</div>
+              <div class="text-[var(--text)]">${Number(account.tpu_quota?.used_hours || 0).toFixed(2)}h / ${account.tpu_quota?.limit_hours || 20}h</div>
+            </div>
+          </div>
+          ${(account.gpu_quota?.reset_at || account.tpu_quota?.reset_at) ? `<div class="text-[10px] text-[var(--muted)] mt-1">Weekly reset: <span class="font-mono">${new Date((account.gpu_quota?.reset_at || account.tpu_quota?.reset_at) * 1000).toLocaleString()}</span></div>` : '<div class="text-[10px] text-[var(--muted)] mt-1">Weekly window starts with the next session.</div>'}
+          <div class="text-[10px] text-[var(--muted)] mt-1">Boot ETA: GPU <span class="font-mono text-[var(--accent)]">~${shortTime(account.boot_estimate_gpu_seconds)}</span> · TPU <span class="font-mono text-[var(--accent)]">~${shortTime(account.boot_estimate_tpu_seconds)}</span>${account.last_boot_seconds ? ` · Last ${shortTime(account.last_boot_seconds)}` : ''}</div>
+          ${account.last_error ? `<div class="text-[10px] text-[var(--bad)] mt-1 line-clamp-2">${escapeHtml(account.last_error)}</div>` : ''}
+          <div class="account-action-grid grid grid-cols-2 gap-1.5 mt-2">
+            <button onclick="activateKaggleAccount('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]" ${account.status === 'ACTIVE' || !account.verified ? 'disabled' : ''}>${account.status === 'ACTIVE' ? 'Active' : 'Set Active'}</button>
+            <button onclick="verifyKaggleAccount('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]">Verify Key</button>
+            <button onclick="testKaggleBoot('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]" ${!account.verified || ['PREWARMING','TESTING_BOOT'].includes(account.status) ? 'disabled' : ''}>Test &amp; Measure Boot</button>
+            <button onclick="resetWeeklyQuota('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]">Reset Weekly Quota</button>
+            <button onclick="toggleAccountProxyDrawer('${account.id}')" class="syn-btn-secondary py-1 text-[10px]">Custom Proxy / IP</button>
+            <button onclick="deleteKaggleAccount('${account.id}', this)" class="syn-btn-stop py-1 px-2 text-[10px]">Delete</button>
+          </div>
+          <div id="proxyDrawer-${account.id}" class="hidden mt-2 border border-[var(--line)] rounded-lg p-2 bg-[var(--surface)] space-y-2">
+            <select id="proxyMode-${account.id}" class="syn-input text-[11px]" onchange="toggleAccountProxyFields('${account.id}')">
+              <option value="webshare" ${account.proxy_mode === 'webshare' ? 'selected' : ''}>Webshare Auto-Rotate (Zero Leak)</option>
+              <option value="custom" ${account.proxy_mode === 'custom' ? 'selected' : ''}>Custom Proxy URL</option>
+              <option value="server" ${account.proxy_mode === 'server' ? 'selected' : ''}>Server Direct (VPS IP - Single Account Only)</option>
+            </select>
+            <input id="proxyUrl-${account.id}" class="syn-input text-[11px] font-mono ${account.proxy_mode === 'custom' ? '' : 'hidden'}" placeholder="http://user:pass@ip:port or socks5://user:pass@ip:port" />
+            <div class="grid grid-cols-2 gap-1.5">
+              <button onclick="saveAccountProxy('${account.id}', this)" class="syn-btn-secondary py-1.5 text-[10px]">Save Route</button>
+              <button onclick="testAccountProxy('${account.id}', this)" class="syn-btn-secondary py-1.5 text-[10px]">Test Proxy IP</button>
+            </div>
+            <div id="proxyResult-${account.id}" class="text-[10px] font-mono text-[var(--muted)]">Current: ${escapeHtml(account.proxy || 'server')} · ${escapeHtml(account.last_exit_ip || 'not tested')}</div>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function renderWebshareStatus(status) {
+      webshareState = status || webshareState;
+      const connected = Boolean(webshareState.connected);
+      const badge = document.getElementById('webshareBadge');
+      badge.innerText = connected ? 'CONNECTED' : 'DISCONNECTED';
+      badge.className = `pill ${connected ? 'pill-ok' : 'pill-neutral'} text-[9px]`;
+      document.getElementById('webshareExitIp').innerText = webshareState.exit_ip || '—';
+      document.getElementById('webshareRefreshUsage').innerText = `${webshareState.refreshes_used || 0} / ${webshareState.refresh_limit || 250} used`;
+      document.getElementById('webshareAutoRefresh').checked = webshareState.auto_refresh !== false;
+      document.getElementById('webshareAutoRefresh').disabled = !connected;
+      document.getElementById('webshareRefreshBtn').disabled = !connected;
+      const error = document.getElementById('webshareError');
+      error.innerText = webshareState.last_error || '';
+      error.classList.toggle('hidden', !webshareState.last_error);
+    }
+
+    async function loadKaggleAccounts() {
+      try {
+        const response = await fetch('/api/kaggle/accounts');
+        const data = await response.json();
+        renderKaggleAccounts(data.accounts || []);
+        renderWebshareStatus(data.webshare || webshareState);
+      } catch (error) {
+        console.error('Account pool load failed:', error);
+      }
+    }
+
+    function selectedAccountProxy() {
+      if (document.getElementById('accountProxyType').value === 'webshare') return 'webshare';
+      if (document.getElementById('accountProxyType').value !== 'custom') return 'server';
+      return document.getElementById('accountProxyUrl').value.trim() || 'server';
+    }
+
+    async function connectWebshare(button) {
+      const token = document.getElementById('webshareToken').value.trim();
+      if (!token) return;
+      const original = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Connecting...';
+      try {
+        const response = await fetch('/api/webshare/connect', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Webshare connection failed');
+        document.getElementById('webshareToken').value = '';
+        renderWebshareStatus(data);
+        button.innerText = 'Connected';
+      } catch (error) {
+        renderWebshareStatus({...webshareState, connected: false, last_error: String(error.message || error)});
+        button.innerText = 'Connect Failed';
+      } finally {
+        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1600);
+      }
+    }
+
+    async function refreshWebshareIp(button) {
+      const original = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Rotating...';
+      try {
+        const response = await fetch('/api/webshare/refresh', {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Refresh failed');
+        renderWebshareStatus(data);
+        button.innerText = 'IP Refreshed';
+      } catch (error) {
+        renderWebshareStatus({...webshareState, last_error: String(error.message || error)});
+        button.innerText = 'Refresh Failed';
+      } finally {
+        setTimeout(() => { button.innerText = original; button.disabled = !webshareState.connected; }, 1600);
+      }
+    }
+
+    async function setWebshareAutoRefresh(enabled) {
+      try {
+        const response = await fetch('/api/webshare/auto-refresh', {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Update failed');
+        renderWebshareStatus(data);
+      } catch (error) {
+        renderWebshareStatus({...webshareState, last_error: String(error.message || error)});
+      }
+    }
+
+    function toggleAccountProxyDrawer(id) {
+      document.getElementById(`proxyDrawer-${id}`).classList.toggle('hidden');
+    }
+
+    function toggleAccountProxyFields(id) {
+      const custom = document.getElementById(`proxyMode-${id}`).value === 'custom';
+      document.getElementById(`proxyUrl-${id}`).classList.toggle('hidden', !custom);
+    }
+
+    async function saveAccountProxy(id, button) {
+      const mode = document.getElementById(`proxyMode-${id}`).value;
+      const proxyUrl = document.getElementById(`proxyUrl-${id}`).value.trim();
+      const result = document.getElementById(`proxyResult-${id}`);
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/kaggle/accounts/${id}/proxy`, {
+          method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode, proxy_url: proxyUrl})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Route save failed');
+        result.innerText = `Saved · Exit IP ${data.account?.last_exit_ip || 'not tested'}`;
+        await loadKaggleAccounts();
+      } catch (error) {
+        result.innerText = String(error.message || error);
+        result.className = 'text-[10px] font-mono text-[var(--bad)]';
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function testAccountProxy(id, button) {
+      const result = document.getElementById(`proxyResult-${id}`);
+      button.disabled = true;
+      button.innerText = 'Testing...';
+      try {
+        const response = await fetch(`/api/kaggle/accounts/${id}/proxy/test`, {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Proxy test failed');
+        result.innerText = `${data.mode} exit IP: ${data.exit_ip}`;
+        result.className = 'text-[10px] font-mono text-[var(--ok)]';
+      } catch (error) {
+        result.innerText = String(error.message || error);
+        result.className = 'text-[10px] font-mono text-[var(--bad)]';
+      } finally {
+        button.innerText = 'Test Proxy IP';
+        button.disabled = false;
+      }
+    }
+
+    function scheduleKaggleUsernameDetection() {
+      clearTimeout(usernameDetectTimer);
+      const key = document.getElementById('kaggleKey').value.trim();
+      if (key.length < 16) return;
+      usernameDetectTimer = setTimeout(async () => {
+        const badge = document.getElementById('credsBadge');
+        badge.innerText = 'Detecting...';
+        badge.className = 'pill pill-warn text-[10px]';
+        try {
+          const response = await fetch('/api/kaggle/detect-username', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({key, proxy: selectedAccountProxy()})
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.detail || 'Detection failed');
+          document.getElementById('kaggleUsername').value = data.username;
+          badge.innerText = `Detected ${data.username}`;
+          badge.className = 'pill pill-ok text-[10px]';
+        } catch (error) {
+          badge.innerText = 'Username Needed';
+          badge.className = 'pill pill-warn text-[10px]';
+        }
+      }, 500);
+    }
+
+    async function addKaggleAccount(button) {
+      const username = document.getElementById('kaggleUsername').value.trim();
+      const key = document.getElementById('kaggleKey').value.trim();
+      if (!key) return;
+      const proxy = selectedAccountProxy();
+      const badge = document.getElementById('credsBadge');
+      badge.innerText = 'Adding...';
+      badge.className = 'pill pill-warn text-[10px]';
+      button.disabled = true;
+      try {
+        const res = await fetch('/api/kaggle/accounts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({username, key, proxy})
+        });
+        const d = await res.json();
+        if (!res.ok) throw new Error(d.detail || 'Add failed');
+        document.getElementById('kaggleUsername').value = '';
+        document.getElementById('kaggleKey').value = '';
+        badge.innerText = d.success ? 'Verified · Ready' : 'Invalid Key';
+        badge.className = `pill ${d.success ? 'pill-ok' : 'pill-bad'} text-[10px]`;
+        await loadKaggleAccounts();
+      } catch (error) {
+        badge.innerText = 'Error';
+        badge.className = 'pill pill-bad text-[10px]';
+        console.error(error);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function bulkAddKaggleAccounts(button) {
+      const text = document.getElementById('kaggleBulkInput').value.trim();
+      if (!text) return;
+      button.disabled = true;
+      button.innerText = 'Importing...';
+      try {
+        const response = await fetch('/api/kaggle/accounts/bulk', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text, proxy: selectedAccountProxy()})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Import failed');
+        document.getElementById('kaggleBulkInput').value = '';
+        renderKaggleAccounts(data.accounts || []);
+        button.innerText = `${data.verified_count} Verified · ${data.invalid_count} Invalid`;
+      } catch (error) {
+        button.innerText = 'Import Error';
+        console.error(error);
+      } finally {
+        setTimeout(() => { button.innerText = 'Import Accounts'; button.disabled = false; }, 1500);
+      }
+    }
+
+    async function activateKaggleAccount(id, button) {
+      button.disabled = true;
+      const response = await fetch(`/api/kaggle/accounts/${id}/activate`, {method: 'POST'});
+      if (!response.ok) console.error(await response.text());
+      await loadKaggleAccounts();
+    }
+
+    async function deleteKaggleAccount(id, button) {
+      button.disabled = true;
+      const response = await fetch(`/api/kaggle/accounts/${id}`, {method: 'DELETE'});
+      if (!response.ok) console.error(await response.text());
+      await loadKaggleAccounts();
+    }
+
+    async function verifyKaggleAccount(id, button) {
+      const original = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Verifying...';
+      try {
+        const response = await fetch(`/api/kaggle/accounts/${id}/verify`, {method: 'POST'});
+        const data = await response.json();
+        button.innerText = data.success ? 'Verified' : 'Invalid Key';
+      } catch (error) {
+        button.innerText = 'Verify Error';
+      } finally {
+        await loadKaggleAccounts();
+        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1400);
+      }
+    }
+
+    async function resetWeeklyQuota(id, button) {
+      const original = button.innerText;
+      button.disabled = true;
+      const response = await fetch(`/api/kaggle/accounts/${id}/reset-weekly`, {method: 'POST'});
+      button.innerText = response.ok ? 'Quota Reset' : 'Reset Error';
+      await loadKaggleAccounts();
+      setTimeout(() => { button.innerText = original; button.disabled = false; }, 1400);
+    }
+
+    async function testKaggleBoot(id, button) {
+      const original = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Starting Test...';
+      try {
+        const response = await fetch(`/api/kaggle/accounts/${id}/test-boot`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({model_id: currentSelectedModelId})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Test failed');
+        button.innerText = 'Test Warming...';
+        await fetchStatus();
+      } catch (error) {
+        button.innerText = 'Test Error';
+        console.error(error);
+      } finally {
+        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1800);
+      }
+    }
+
+    async function triggerPrewarm(button) {
+      const original = button.innerText;
+      button.disabled = true;
+      button.innerText = 'Starting Tunnel B...';
+      try {
+        const response = await fetch('/api/lifecycle/prewarm', {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Pre-warm failed');
+        await fetchStatus();
+      } catch (error) {
+        button.innerText = 'Unavailable';
+        console.error(error);
+      } finally {
+        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1600);
+      }
+    }
+
+    async function runInferenceTest() {
+      const prompt = document.getElementById('promptInput').value.trim();
+      if (!prompt) return;
+      const btn = document.getElementById('sendTestBtn');
+      const out = document.getElementById('testOutputBox');
+      const latEl = document.getElementById('testLatency');
+      btn.disabled = true;
+      out.innerText = 'Awaiting generation...';
+      const t0 = Date.now();
+      try {
+        const res = await fetch('/api/test/inference', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({prompt: prompt, model_id: document.getElementById('modelSelectVal').value})
+        });
+        const d = await res.json();
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+        latEl.innerText = `Latency: ${elapsed}s`;
+        if (d.success) {
+          out.innerText = d.output || 'No output text returned.';
+        } else {
+          out.innerText = 'Notice: ' + (d.error || 'Request failed');
+        }
+      } catch (e) {
+        out.innerText = 'Request Exception: ' + e;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function copyTunnelUrl() {
+      copyField('tunnelUrlInput');
+    }
+
+    async function clearLogs() {
+      document.getElementById('logConsole').innerHTML = '<div>Console cleared.</div>';
+      try {
+        await fetch('/api/logs/clear', {method: 'POST'});
+      } catch (e) {}
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.innerText = text;
+      return div.innerHTML;
+    }
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        updateStatusUI(data);
+      } catch (e) {
+        console.error('Fetch status failed:', e);
+      }
+    }
+
+    // Init
+    loadClientConfig();
+    loadKaggleAccounts();
+    fetchStatus();
+    setInterval(fetchStatus, 3000);
+    setInterval(tickLiveTimer, 1000);
+  </script>
+</body>
+</html>
