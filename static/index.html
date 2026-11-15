@@ -377,6 +377,10 @@
       background: var(--surface); border: 1px solid var(--line-strong); border-radius: 14px;
       box-shadow: 0 24px 70px rgba(0,0,0,.55); padding: 16px;
     }
+    .accelerator-segment { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+    .accelerator-segment button { border: 1px solid transparent; border-radius: 8px; padding: 8px 6px; color: var(--muted); font-size: 10px; line-height: 1.25; transition: all .15s ease; }
+    .accelerator-segment button.active { color: var(--on-accent); background: var(--accent); border-color: var(--accent); font-weight: 700; }
+    .model-incompatible { opacity: .45; cursor: not-allowed !important; }
   </style>
 </head>
 <body class="p-3 sm:p-6 max-w-7xl mx-auto">
@@ -472,6 +476,13 @@
         </div>
 
         <div class="space-y-3">
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Hardware Accelerator Mode</label>
+            <div class="accelerator-segment" id="acceleratorMode" role="group" aria-label="Hardware accelerator mode">
+              <button id="acceleratorGpuBtn" type="button" class="active" onclick="setAcceleratorMode('gpu')">⚡ Dual T4 GPU<br><span class="font-normal">32GB VRAM · Instant 4m Boot</span></button>
+              <button id="acceleratorTpuBtn" type="button" onclick="setAcceleratorMode('tpu')">🧠 TPU v5e-8<br><span class="font-normal">128GB HBM · High Queue</span></button>
+            </div>
+          </div>
           <div>
             <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Target Model (Custom Selector)</label>
             <!-- Custom Dropdown Component -->
@@ -684,31 +695,37 @@
                 <button type="button" class="custom-dropdown-item text-left w-full" data-value="custom" onclick="chooseDefaultRoute('custom', 'Custom HTTP / SOCKS5 Proxy')"><span>Custom HTTP / SOCKS5 Proxy</span><small class="text-[10px] text-[var(--muted)]">Provide one protected route for accounts using the default.</small></button>
               </div>
             </div>
-            <div id="defaultCustomProxyRow" class="hidden mt-2 flex gap-2">
-              <input id="defaultCustomProxy" class="syn-input text-[11px] font-mono" placeholder="http://user:pass@host:port or socks5://user:pass@host:port" />
-              <button onclick="saveDefaultRoute(this)" class="syn-btn-secondary text-[10px] px-2 whitespace-nowrap">Verify &amp; Save</button>
-            </div>
             <div id="defaultRouteNote" class="text-[10px] text-[var(--muted)] mt-1">Direct mode needs no proxy and remains fully functional.</div>
           </div>
 
-          <div class="rounded-lg border border-[var(--line)] bg-[var(--surface-2)] p-2.5 space-y-2">
+          <div id="webshareShield" class="hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)] p-2.5 space-y-2">
             <div class="flex items-center justify-between gap-2">
               <span class="text-[11px] font-semibold">Webshare Shield</span>
               <span id="webshareBadge" class="pill pill-neutral text-[9px]">NOT CONNECTED</span>
             </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] font-mono">
-              <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-2">Exit IP: <span id="webshareExitIp" class="text-[var(--accent)]">—</span></div>
-              <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-2">Refreshes: <span id="webshareRefreshUsage">0 / 250 used</span></div>
+            <div id="webshareDisconnectedState" class="space-y-2">
+              <p class="text-[10px] text-[var(--muted)]">Connect your Webshare API key to enable 250x/month IP rotation and zero-IP-leak shield.</p>
+              <button onclick="openWebshareModal()" class="syn-btn-primary w-full text-[10px]">Connect Webshare API Key</button>
             </div>
-            <div class="grid grid-cols-2 gap-2">
-              <button onclick="openWebshareModal()" class="syn-btn-secondary py-1.5 px-2 text-[10px]">Connect / Change Webshare Key</button>
-              <button id="webshareRefreshBtn" onclick="refreshWebshareIp(this)" class="syn-btn-secondary py-1.5 px-2 text-[10px]" disabled>Refresh IP Now</button>
-            </div>
-            <div class="flex items-center justify-between gap-2 text-[10px] text-[var(--muted)]">
-              <span>Auto-refresh on account switch &amp; pre-warm</span>
-              <button id="webshareAutoRefresh" type="button" class="ui-toggle compact" role="switch" aria-checked="true" onclick="setWebshareAutoRefresh(this.getAttribute('aria-checked') !== 'true')"><span></span></button>
+            <div id="webshareConnectedState" class="hidden space-y-2">
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] font-mono">
+                <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-2">Exit IP: <span id="webshareExitIp" class="text-[var(--accent)]">—</span></div>
+                <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-2">Refreshes: <span id="webshareRefreshUsage">0 / 250 used</span></div>
+              </div>
+              <div class="flex items-center justify-between gap-2 text-[10px] text-[var(--muted)]"><span>Auto-refresh on account switch &amp; pre-warm</span><button id="webshareAutoRefresh" type="button" class="ui-toggle compact" role="switch" aria-checked="true" onclick="setWebshareAutoRefresh(this.getAttribute('aria-checked') !== 'true')"><span></span></button></div>
+              <div class="grid grid-cols-3 gap-1.5">
+                <button onclick="openWebshareModal()" class="syn-btn-secondary py-1.5 px-1 text-[9px]">Change Webshare Key</button>
+                <button id="webshareRefreshBtn" onclick="refreshWebshareIp(this)" class="syn-btn-secondary py-1.5 px-1 text-[9px]">Refresh IP Now</button>
+                <button onclick="disconnectWebshare(this)" class="syn-btn-stop py-1.5 px-1 text-[9px]">Disconnect</button>
+              </div>
             </div>
             <div id="webshareError" class="hidden text-[10px] text-[var(--bad)]"></div>
+          </div>
+
+          <div id="customProxyShield" class="hidden rounded-lg border border-[var(--line)] bg-[var(--surface-2)] p-2.5 space-y-2">
+            <div class="flex items-center justify-between gap-2"><span class="text-[11px] font-semibold">Custom Proxy Shield</span><span id="customProxyBadge" class="pill pill-neutral text-[9px]">NOT CONFIGURED</span></div>
+            <p id="customProxyStatus" class="text-[10px] text-[var(--muted)]">Configure and verify an HTTP or SOCKS5 proxy for inherited accounts.</p>
+            <button onclick="openModal('defaultCustomProxyModal')" class="syn-btn-primary w-full text-[10px]">Configure Custom Proxy</button>
           </div>
         </div>
       </section>
@@ -879,6 +896,15 @@ friend1:legacy_key
     </div>
   </div>
 
+  <div id="defaultCustomProxyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="defaultCustomProxyTitle" onclick="if(event.target === this) closeModal('defaultCustomProxyModal')">
+    <div class="modal-panel space-y-3">
+      <div class="flex items-center justify-between gap-2"><div><h3 id="defaultCustomProxyTitle" class="text-sm font-semibold">Configure Default Custom Proxy</h3><p class="text-[10px] text-[var(--muted)] mt-1">Inherited accounts will use this route. Explicit per-account overrides remain unchanged.</p></div><button onclick="closeModal('defaultCustomProxyModal')" class="syn-btn-secondary px-2 py-1 text-xs">✕</button></div>
+      <input id="defaultCustomProxy" class="syn-input text-xs font-mono" placeholder="http://user:pass@host:port or socks5://user:pass@host:port" />
+      <div id="defaultCustomProxyResult" class="text-[10px] text-[var(--muted)]">GPU Hub will verify the proxy exit IP before saving.</div>
+      <button onclick="saveDefaultRoute(this)" class="syn-btn-primary w-full text-xs">Test, Verify &amp; Save</button>
+    </div>
+  </div>
+
   <!-- Script logic -->
   <script>
     // ── Global State & Timer ────────────────────────────────────
@@ -891,6 +917,7 @@ friend1:legacy_key
     let currentWarmup = null;
     let usernameDetectTimer = null;
     let hubSettings = {auto_key_rotation: true, default_network_route: 'server'};
+    let acceleratorMode = 'gpu';
 
     function formatElapsed(totalSec) {
       if (totalSec < 0) totalSec = 0;
@@ -1020,6 +1047,8 @@ friend1:legacy_key
     });
 
     function selectModelOption(id, name) {
+      const spec = modelSpecs[id];
+      if (spec && !(spec.supported_accelerators || [spec.accelerator]).includes(acceleratorMode)) return;
       currentSelectedModelId = id;
       document.getElementById('modelSelectVal').value = id;
       document.getElementById('modelDropdownLabel').innerText = name;
@@ -1041,6 +1070,47 @@ friend1:legacy_key
       });
     }
 
+    function modelSupportsMode(model) {
+      return (model?.supported_accelerators || [model?.accelerator || 'gpu']).includes(acceleratorMode);
+    }
+
+    function modelHardwarePill(model) {
+      const supported = model?.supported_accelerators || [model?.accelerator || 'gpu'];
+      if (supported.includes('gpu') && supported.includes('tpu')) return 'DUAL T4 / TPU';
+      return supported.includes('tpu') ? 'TPU ONLY · 128GB' : 'DUAL T4 · 32GB';
+    }
+
+    async function setAcceleratorMode(mode, persist = true) {
+      acceleratorMode = mode === 'tpu' ? 'tpu' : 'gpu';
+      document.getElementById('acceleratorGpuBtn')?.classList.toggle('active', acceleratorMode === 'gpu');
+      document.getElementById('acceleratorTpuBtn')?.classList.toggle('active', acceleratorMode === 'tpu');
+      if (persist) {
+        const response = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({accelerator_mode: acceleratorMode})});
+        if (!response.ok) return;
+        hubSettings = await response.json();
+      }
+      if (activeState) {
+        renderModelDropdown(activeState.available_models || []);
+        renderModelCards(activeState);
+        updateLaunchAndStopButtons(activeState);
+        updateSpecDetails(currentSelectedModelId);
+      }
+    }
+
+    function renderModelDropdown(models) {
+      const menu = document.getElementById('modelDropdownMenu');
+      if (!menu) return;
+      menu.innerHTML = models.map(model => {
+        modelSpecs[model.id] = model;
+        const compatible = modelSupportsMode(model);
+        const requirement = acceleratorMode === 'gpu' ? 'Requires TPU Mode · 128GB' : 'Requires Dual T4 GPU';
+        const ctx = model.context_display || `${Number(model.context_length || 32768).toLocaleString()} tok`;
+        return `<button type="button" class="custom-dropdown-item text-left w-full ${compatible ? '' : 'model-incompatible'} ${model.id === currentSelectedModelId ? 'active' : ''}" data-id="${model.id}" ${compatible ? `onclick="selectModelOption('${model.id}', '${escapeHtml(model.name)}')"` : 'disabled'}>
+          <div class="flex justify-between items-center gap-2"><span class="font-medium">${escapeHtml(model.name)}</span><span class="pill ${compatible ? 'pill-info' : 'pill-warn'} text-[8px] shrink-0">${compatible ? modelHardwarePill(model) : requirement}</span></div>
+          <span class="text-[10px] text-[var(--muted)]">Rank ${model.rank || '-'} · ${escapeHtml(ctx)}</span></button>`;
+      }).join('');
+    }
+
     function routeLabel(route) {
       return {
         server: 'Server Direct (VPS Network · No Proxy Required)',
@@ -1053,8 +1123,22 @@ friend1:legacy_key
       document.getElementById('defaultRouteValue').value = value;
       document.getElementById('defaultRouteLabel').innerText = label;
       document.getElementById('defaultRouteWrap').classList.remove('open');
-      document.getElementById('defaultCustomProxyRow').classList.toggle('hidden', value !== 'custom');
-      if (value !== 'custom') saveDefaultRoute();
+      applyRouteVisibility(value);
+      if (value === 'custom') openModal('defaultCustomProxyModal');
+      else saveDefaultRoute();
+    }
+
+    function applyRouteVisibility(route) {
+      const webshare = route === 'webshare';
+      const custom = route === 'custom';
+      document.getElementById('webshareShield')?.classList.toggle('hidden', !webshare);
+      document.getElementById('customProxyShield')?.classList.toggle('hidden', !custom);
+      const badge = document.getElementById('shieldSummaryBadge');
+      if (badge) {
+        badge.innerText = route === 'server' ? 'SERVER DIRECT' : route === 'webshare' ? (webshareState.connected ? 'WEBSHARE CONNECTED' : 'WEBSHARE') : 'CUSTOM PROXY';
+        badge.className = `pill ${route === 'server' ? 'pill-info' : webshareState.connected || custom ? 'pill-ok' : 'pill-warn'} text-[9px]`;
+      }
+      document.getElementById('defaultRouteNote').innerText = route === 'server' ? 'Server Direct is active. No proxy is required.' : route === 'webshare' ? 'Inherited accounts use Webshare after it is connected.' : 'Inherited accounts use the verified custom proxy.';
     }
 
     async function loadSettings() {
@@ -1065,7 +1149,13 @@ friend1:legacy_key
         const route = hubSettings.default_network_route || 'server';
         document.getElementById('defaultRouteValue').value = route;
         document.getElementById('defaultRouteLabel').innerText = routeLabel(route);
-        document.getElementById('defaultCustomProxyRow').classList.toggle('hidden', route !== 'custom');
+        applyRouteVisibility(route);
+        if (route === 'custom' && hubSettings.default_custom_proxy_configured) {
+          document.getElementById('customProxyBadge').innerText = 'VERIFIED';
+          document.getElementById('customProxyBadge').className = 'pill pill-ok text-[9px]';
+          document.getElementById('customProxyStatus').innerText = 'A verified custom proxy is configured for inherited accounts.';
+        }
+        await setAcceleratorMode(hubSettings.accelerator_mode || 'gpu', false);
       } catch (error) {
         console.error('Settings load failed:', error);
       }
@@ -1098,6 +1188,15 @@ friend1:legacy_key
         note.innerText = route === 'server' ? 'Direct mode saved. No proxy is required.' : `${routeLabel(route)} saved as the default route.`;
         note.className = 'text-[10px] text-[var(--ok)] mt-1';
         if (route === 'custom') document.getElementById('defaultCustomProxy').value = '';
+        applyRouteVisibility(route);
+        if (route === 'custom') {
+          document.getElementById('customProxyBadge').innerText = 'VERIFIED';
+          document.getElementById('customProxyBadge').className = 'pill pill-ok text-[9px]';
+          document.getElementById('customProxyStatus').innerText = 'A verified custom proxy is configured for inherited accounts.';
+          document.getElementById('defaultCustomProxyResult').innerText = 'Proxy verified and saved.';
+          document.getElementById('defaultCustomProxyResult').className = 'text-[10px] text-[var(--ok)]';
+          setTimeout(() => closeModal('defaultCustomProxyModal'), 650);
+        }
       } catch (error) {
         note.innerText = String(error.message || error);
         note.className = 'text-[10px] text-[var(--bad)] mt-1';
@@ -1188,6 +1287,8 @@ friend1:legacy_key
       const isRunning = (status === 'ready' || status === 'running');
       const isDeploying = (status === 'initializing' || status === 'downloading' || status === 'loading_vram' || status === 'warming');
       const isSelectedModelRunning = isRunning && (currentSelectedModelId === data.active_model_id);
+      const selectedSpec = modelSpecs[currentSelectedModelId];
+      const compatible = !selectedSpec || modelSupportsMode(selectedSpec);
 
       // Stop button: enabled in EVERY non-idle state. Even on error a Kaggle
       // session may still be alive burning GPU quota — Stop must always be
@@ -1202,7 +1303,15 @@ friend1:legacy_key
 
       // Launch button state
       if (launchBtn && launchBtnText) {
-        if (isDeploying) {
+        if (!compatible) {
+          launchBtn.disabled = true;
+          launchBtn.classList.add('opacity-50', 'cursor-not-allowed');
+          launchBtnText.innerText = acceleratorMode === 'gpu' ? 'Requires TPU v5e-8 (Switch Hardware Above)' : 'Requires Dual T4 GPU';
+        } else if (selectedSpec?.launch_supported === false) {
+          launchBtn.disabled = true;
+          launchBtn.classList.add('opacity-50', 'cursor-not-allowed');
+          launchBtnText.innerText = 'Verified Runner Not Yet Bundled';
+        } else if (isDeploying) {
           launchBtn.disabled = true;
           launchBtn.classList.add('opacity-50', 'cursor-not-allowed');
           launchBtnText.innerText = 'Deploying...';
@@ -1230,13 +1339,17 @@ friend1:legacy_key
         modelSpecs[m.id] = m;
         const isThisRunning = isRunning && (m.id === data.active_model_id);
         const isSelected = (m.id === currentSelectedModelId);
+        const compatible = modelSupportsMode(m);
 
         let cardClass = 'syn-model-card';
+        if (!compatible) cardClass += ' model-incompatible';
         if (isThisRunning) cardClass += ' running';
         else if (isSelected) cardClass += ' selected';
 
         let badgeHtml = '';
-        if (isThisRunning) {
+        if (!compatible) {
+          badgeHtml = `<span class="pill pill-warn text-[9px]">${acceleratorMode === 'gpu' ? 'Requires TPU Mode · 128GB' : 'Requires Dual T4 GPU'}</span>`;
+        } else if (isThisRunning) {
           badgeHtml = '<span class="pill pill-ok text-[10px]"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>Running</span>';
         } else if (isSelected) {
           badgeHtml = '<span class="pill pill-info text-[10px]">Selected</span>';
@@ -1245,7 +1358,9 @@ friend1:legacy_key
         }
 
         let actionBtnHtml = '';
-        if (isThisRunning) {
+        if (!compatible) {
+          actionBtnHtml = `<button class="syn-btn-secondary w-full text-xs py-1.5 opacity-50 cursor-not-allowed" disabled>${acceleratorMode === 'gpu' ? 'Requires TPU Mode' : 'Requires Dual T4 GPU'}</button>`;
+        } else if (isThisRunning) {
           actionBtnHtml = `<button class="syn-btn-secondary w-full text-xs py-1.5 opacity-50 cursor-not-allowed font-medium" disabled title="Model is currently active and running on Kaggle">Running</button>`;
         } else if (isSelected) {
           actionBtnHtml = `<button onclick="launchKernel()" class="syn-btn-primary w-full text-xs py-1.5 font-semibold cursor-pointer" title="Launch ${escapeHtml(m.name)} on Kaggle">Launch Model</button>`;
@@ -1256,12 +1371,13 @@ friend1:legacy_key
         const ctx = m.context_display || (m.context_length ? (m.context_length.toLocaleString() + ' tok') : '32k');
 
         html += `
-          <div class="${cardClass}" onclick="if(!event.target.closest('button')) selectModelOption('${m.id}', '${escapeHtml(m.name)}')">
+          <div class="${cardClass}" ${compatible ? `onclick="if(!event.target.closest('button')) selectModelOption('${m.id}', '${escapeHtml(m.name)}')"` : ''}>
             <div>
               <div class="flex items-start justify-between gap-1.5 mb-1.5">
                 <span class="font-semibold text-xs text-[var(--text)] leading-tight">${escapeHtml(m.name)}</span>
                 <div class="flex items-center gap-1 shrink-0">
                   <span class="pill pill-neutral text-[9px] font-mono">Rank ${m.rank || '-'}</span>
+                  <span class="pill pill-info text-[8px]">${modelHardwarePill(m)}</span>
                   ${badgeHtml}
                 </div>
               </div>
@@ -1382,23 +1498,7 @@ friend1:legacy_key
 
       // Populate Model Dropdown once
       if (data.available_models) {
-        const menu = document.getElementById('modelDropdownMenu');
-        let html = '';
-        data.available_models.forEach(m => {
-          modelSpecs[m.id] = m;
-          const isActive = m.id === currentSelectedModelId;
-          const ctxDisplay = m.context_display || ((m.context_length || 32768).toLocaleString() + ' tok');
-          html += `
-            <div class="custom-dropdown-item ${isActive ? 'active' : ''}" data-id="${m.id}" onclick="selectModelOption('${m.id}', '${m.name}')">
-              <div class="flex justify-between items-center">
-                <span class="font-medium">${m.name}</span>
-                <span class="text-[10px] text-[var(--accent)] font-mono">Rank ${m.rank || '-'} &middot; ${ctxDisplay}</span>
-              </div>
-              <span class="text-[10.5px] text-[var(--muted)] truncate">${m.description || m.parameters}</span>
-            </div>
-          `;
-        });
-        menu.innerHTML = html;
+        renderModelDropdown(data.available_models);
       }
 
       if (data.active_model_id && !currentSelectedModelId) {
@@ -1501,7 +1601,7 @@ friend1:legacy_key
         const res = await fetch('/api/kaggle/launch', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({model_id: id})
+          body: JSON.stringify({model_id: id, accelerator_mode: acceleratorMode})
         });
         const d = await res.json();
         await fetchStatus();
@@ -1645,8 +1745,8 @@ friend1:legacy_key
       const badge = document.getElementById('webshareBadge');
       badge.innerText = connected ? 'CONNECTED' : 'NOT CONNECTED';
       badge.className = `pill ${connected ? 'pill-ok' : 'pill-neutral'} text-[9px]`;
-      document.getElementById('shieldSummaryBadge').innerText = connected ? 'SHIELD CONNECTED' : 'DIRECT READY';
-      document.getElementById('shieldSummaryBadge').className = `pill ${connected ? 'pill-ok' : 'pill-info'} text-[9px]`;
+      document.getElementById('webshareDisconnectedState')?.classList.toggle('hidden', connected);
+      document.getElementById('webshareConnectedState')?.classList.toggle('hidden', !connected);
       document.getElementById('webshareExitIp').innerText = webshareState.exit_ip || '—';
       document.getElementById('webshareRefreshUsage').innerText = `${webshareState.refreshes_used || 0} / ${webshareState.refresh_limit || 250} used`;
       setToggleState('webshareAutoRefresh', webshareState.auto_refresh !== false);
@@ -1655,6 +1755,7 @@ friend1:legacy_key
       const error = document.getElementById('webshareError');
       error.innerText = webshareState.last_error || '';
       error.classList.toggle('hidden', !webshareState.last_error);
+      applyRouteVisibility(document.getElementById('defaultRouteValue')?.value || 'server');
     }
 
     async function loadKaggleAccounts() {
@@ -1689,6 +1790,9 @@ friend1:legacy_key
         if (!response.ok) throw new Error(data.detail || 'Webshare connection failed');
         document.getElementById('webshareToken').value = '';
         renderWebshareStatus(data);
+        document.getElementById('defaultRouteValue').value = 'webshare';
+        document.getElementById('defaultRouteLabel').innerText = routeLabel('webshare');
+        applyRouteVisibility('webshare');
         result.innerText = `Connected · Exit IP ${data.exit_ip || 'verified'}`;
         result.className = 'text-[10px] text-[var(--ok)]';
         setTimeout(() => closeModal('webshareModal'), 650);

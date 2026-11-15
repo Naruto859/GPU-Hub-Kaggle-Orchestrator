@@ -92,7 +92,28 @@ class InferenceProxy:
             raise HTTPException(status_code=401, detail="Invalid or missing Client API Key")
 
     def active_model(self) -> Dict[str, Any]:
-        return self.models.get(self.manager.active_model_id) or next(iter(self.models.values()))
+        try:
+            return self.manager.model_spec(self.manager.active_model_id)
+        except Exception:
+            return self.models.get(self.manager.active_model_id) or next(iter(self.models.values()))
+
+    def normalize_request_body(self, body: dict) -> dict:
+        """Use the active upstream alias and keep requested output inside context."""
+        normalized = dict(body or {})
+        normalized["model"] = self.manager.active_model_id
+        context = int(self.active_model().get("context_length") or 65536)
+        prompt_chars = len(json.dumps(normalized.get("messages", normalized.get("prompt", "")), ensure_ascii=False))
+        estimated_prompt_tokens = max(1, prompt_chars // 4)
+        safe_max = max(1, context - estimated_prompt_tokens - 256)
+        for key in ("max_tokens", "max_completion_tokens"):
+            if key in normalized:
+                try:
+                    normalized[key] = max(1, min(int(normalized[key]), safe_max))
+                except (TypeError, ValueError):
+                    normalized[key] = min(4096, safe_max)
+        if "max_tokens" not in normalized and "max_completion_tokens" not in normalized:
+            normalized["max_tokens"] = min(4096, safe_max)
+        return normalized
 
     def gate(self) -> FairGate:
         capacity = int(self.active_model().get("max_concurrency", 1))
@@ -177,13 +198,40 @@ class InferenceProxy:
         self.manager.release_upstream(upstream_url)
         await gate.release()
 
+    async def _open_with_retry(self, path: str, body: dict, is_stream: bool):
+        transient = {502, 503, 504}
+        last_error = None
+        for attempt in range(4):
+            gate, upstream_url = await self._begin()
+            client = self.closeable_client()
+            upstream = f"{upstream_url.rstrip('/')}{path}"
+            try:
+                if is_stream:
+                    request = client.build_request("POST", upstream, json=body, headers=self.upstream_headers())
+                    response = await client.send(request, stream=True)
+                else:
+                    response = await client.post(upstream, json=body, headers=self.upstream_headers())
+            except (httpx.TransportError, OSError, ConnectionError) as exc:
+                last_error = exc
+                await self._finish(gate, upstream_url)
+                if attempt >= 3:
+                    raise
+                await asyncio.sleep(2)
+                continue
+            if response.status_code in transient and attempt < 3:
+                if is_stream:
+                    await response.aclose()
+                await self._finish(gate, upstream_url)
+                await asyncio.sleep(2)
+                continue
+            return response, gate, upstream_url
+        raise last_error or RuntimeError("Upstream retry attempts exhausted")
+
     async def raw_proxy(self, path: str, body: dict, is_stream: bool) -> Response:
-        gate, upstream_url = await self._begin()
-        client = self.closeable_client()
-        upstream = f"{upstream_url.rstrip('/')}{path}"
+        body = self.normalize_request_body(body)
+        response, gate, upstream_url = await self._open_with_retry(path, body, is_stream)
         if not is_stream:
             try:
-                response = await client.post(upstream, json=body, headers=self.upstream_headers())
                 return Response(
                     content=response.content,
                     status_code=response.status_code,
@@ -191,12 +239,6 @@ class InferenceProxy:
                 )
             finally:
                 await self._finish(gate, upstream_url)
-        try:
-            request = client.build_request("POST", upstream, json=body, headers=self.upstream_headers())
-            response = await client.send(request, stream=True)
-        except BaseException:
-            await self._finish(gate, upstream_url)
-            raise
 
         async def stream():
             try:
@@ -217,6 +259,7 @@ class InferenceProxy:
     async def chat(self, request: Request) -> Response:
         self.authenticate(request)
         body = await request.json()
+        body = self.normalize_request_body(body)
         is_stream = bool(body.get("stream", False))
         body.setdefault("presence_penalty", 0.3)
         body.setdefault("frequency_penalty", 0.3)
@@ -233,6 +276,7 @@ class InferenceProxy:
     async def completions(self, request: Request) -> Response:
         self.authenticate(request)
         body = await request.json()
+        body = self.normalize_request_body(body)
         is_stream = bool(body.get("stream", False))
         if self.mock_mode_getter():
             prompt = body.get("prompt", "")
@@ -294,6 +338,7 @@ class InferenceProxy:
     async def messages(self, request: Request) -> Response:
         self.authenticate(request)
         body = await request.json()
+        body = self.normalize_request_body(body)
         is_stream = bool(body.get("stream", False))
         if self.active_model().get("native_anthropic") and not self.mock_mode_getter():
             return await self.raw_proxy("/v1/messages", body, is_stream)
@@ -305,14 +350,8 @@ class InferenceProxy:
             return self._anthropic_mock(message_id, model_name, mock["choices"][0]["message"]["content"], is_stream)
         if is_stream:
             return await self._anthropic_stream(message_id, model_name, openai_body)
-        gate, upstream_url = await self._begin()
+        response, gate, upstream_url = await self._open_with_retry("/v1/chat/completions", openai_body, False)
         try:
-            client = self.closeable_client()
-            response = await client.post(
-                f"{upstream_url.rstrip('/')}/v1/chat/completions",
-                json=openai_body,
-                headers=self.upstream_headers(),
-            )
             if response.status_code != 200:
                 return Response(content=response.content, status_code=response.status_code, media_type=response.headers.get("content-type"))
             data = response.json()
@@ -329,16 +368,7 @@ class InferenceProxy:
             await self._finish(gate, upstream_url)
 
     async def _anthropic_stream(self, message_id: str, model_name: str, openai_body: dict) -> Response:
-        gate, upstream_url = await self._begin()
-        client = self.closeable_client()
-        try:
-            request = client.build_request(
-                "POST", f"{upstream_url.rstrip('/')}/v1/chat/completions", json=openai_body, headers=self.upstream_headers()
-            )
-            response = await client.send(request, stream=True)
-        except BaseException:
-            await self._finish(gate, upstream_url)
-            raise
+        response, gate, upstream_url = await self._open_with_retry("/v1/chat/completions", openai_body, True)
 
         async def stream():
             output_tokens = 0

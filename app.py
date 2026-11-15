@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Any
@@ -15,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from kaggle_manager import KaggleKernelManager
-from models_registry import MODELS, DEFAULT_MODEL_ID, save_custom_model, load_custom_models
+from models_registry import MODELS, DEFAULT_MODEL_ID, save_custom_model, load_custom_models, normalize_model_id
 from proxy_service import InferenceProxy
 from webshare_manager import ProxyRouteError
 
@@ -26,6 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 SECRET_PATH = BASE_DIR / "client_secret.json"
 STATIC_DIR = BASE_DIR / "static"
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 # ==============================================================================
 # State & Persistence
@@ -54,15 +56,17 @@ def load_persisted_config() -> Dict[str, Any]:
         "auto_key_rotation": True,
         "default_network_route": "server",
         "default_custom_proxy": "",
+        "accelerator_mode": "gpu",
     }
 
 def save_persisted_config(data: Dict[str, Any]):
     try:
-        tmp = CONFIG_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(CONFIG_PATH)
-        os.chmod(CONFIG_PATH, 0o600)
+        with _CONFIG_WRITE_LOCK:
+            tmp = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(CONFIG_PATH)
+            os.chmod(CONFIG_PATH, 0o600)
     except Exception as e:
         logger.warning(f"Error saving {CONFIG_PATH}: {e}")
 
@@ -78,14 +82,15 @@ def load_secret_config() -> Dict[str, str]:
 
 def save_secret_config() -> None:
     try:
-        tmp = SECRET_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({
-            "client_api_key": client_api_key,
-            "upstream_api_key": getattr(manager, "upstream_api_key", ""),
-        }, indent=2), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(SECRET_PATH)
-        os.chmod(SECRET_PATH, 0o600)
+        with _CONFIG_WRITE_LOCK:
+            tmp = SECRET_PATH.with_name(f".{SECRET_PATH.name}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps({
+                "client_api_key": client_api_key,
+                "upstream_api_key": getattr(manager, "upstream_api_key", ""),
+            }, indent=2), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(SECRET_PATH)
+            os.chmod(SECRET_PATH, 0o600)
     except Exception as e:
         logger.warning(f"Error saving {SECRET_PATH}: {e}")
 
@@ -93,7 +98,7 @@ saved_conf = load_persisted_config()
 saved_secrets = load_secret_config()
 manager = KaggleKernelManager(config_callback=lambda: sync_config())
 manager.clear_recovery_state()
-manager.active_model_id = saved_conf.get("active_model_id", DEFAULT_MODEL_ID)
+manager.active_model_id = normalize_model_id(saved_conf.get("active_model_id", DEFAULT_MODEL_ID))
 manager.tunnel_url = saved_conf.get("tunnel_url", "")
 manager.tunnel_type = saved_conf.get("tunnel_type", "cloudflare")
 manager.kaggle_proxy = saved_conf.get("kaggle_proxy", "server")
@@ -104,6 +109,8 @@ manager.max_runtime_min = float(saved_conf.get("max_runtime_min", 540.0))
 manager.auto_key_rotation = bool(saved_conf.get("auto_key_rotation", True))
 manager.default_network_route = str(saved_conf.get("default_network_route") or "server")
 manager.default_custom_proxy = str(saved_conf.get("default_custom_proxy") or "")
+manager.accelerator_mode = str(saved_conf.get("accelerator_mode") or "gpu")
+manager.apply_default_route_to_inherited_accounts()
 if manager.max_runtime_min == 330.0:  # migrate the previous default to Kaggle's 9-hour session cap
     manager.max_runtime_min = 540.0
 client_api_key = str(saved_secrets.get("client_api_key") or saved_conf.get("client_api_key") or "").strip()
@@ -129,6 +136,7 @@ def sync_config():
         "auto_key_rotation": bool(manager.auto_key_rotation),
         "default_network_route": manager.default_network_route,
         "default_custom_proxy": manager.default_custom_proxy,
+        "accelerator_mode": manager.accelerator_mode,
     })
     save_secret_config()
 
@@ -159,6 +167,7 @@ async def get_status():
     state["auto_wake"] = auto_wake
     state["auto_key_rotation"] = bool(manager.auto_key_rotation)
     state["default_network_route"] = manager.default_network_route
+    state["accelerator_mode"] = manager.accelerator_mode
     state["webshare"] = manager.webshare.public_status()
     return state
 
@@ -170,6 +179,7 @@ async def get_settings():
         "default_network_route": manager.default_network_route,
         "default_custom_proxy_configured": bool(manager.default_custom_proxy),
         "webshare_connected": manager.webshare.public_status().get("connected", False),
+        "accelerator_mode": manager.accelerator_mode,
     }
 
 
@@ -183,18 +193,15 @@ async def update_settings(req: Request):
         if route not in {"server", "webshare", "custom"}:
             raise HTTPException(status_code=400, detail="Invalid default network route")
         custom_url = str(data.get("custom_proxy_url") or manager.default_custom_proxy or "").strip()
-        if route == "custom":
-            if not custom_url:
-                raise HTTPException(status_code=400, detail="Custom proxy URL is required")
-            try:
-                manager._validate_proxy_choice(custom_url)
-                await asyncio.to_thread(manager.webshare.test_proxy, custom_url, True)
-            except (ValueError, ProxyRouteError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc))
-            manager.default_custom_proxy = custom_url
-        else:
-            manager.default_custom_proxy = ""
-        manager.default_network_route = route
+        try:
+            await asyncio.to_thread(manager.set_default_network_route, route, custom_url)
+        except (ValueError, ProxyRouteError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+    if "accelerator_mode" in data:
+        accelerator = str(data.get("accelerator_mode") or "gpu").lower()
+        if accelerator not in {"gpu", "tpu"}:
+            raise HTTPException(status_code=400, detail="accelerator_mode must be gpu or tpu")
+        manager.accelerator_mode = accelerator
     sync_config()
     return {"success": True, **(await get_settings())}
 
@@ -249,12 +256,13 @@ async def connect_webshare(req: Request):
     if not token:
         raise HTTPException(status_code=400, detail="Webshare API token is required")
     try:
-        status = await asyncio.to_thread(manager.webshare.connect, token)
+        status = await asyncio.to_thread(manager.connect_webshare, token)
     except (ValueError, ProxyRouteError) as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     manager.log(
         f"Webshare connected with {status.get('proxy_count', 0)} proxy route(s); verified exit {status.get('exit_ip') or 'unknown'}."
     )
+    sync_config()
     return {"success": True, **status}
 
 
@@ -445,7 +453,7 @@ async def trigger_manual_prewarm():
 @app_manager.post("/api/model/select")
 async def select_model(req: Request):
     data = await req.json()
-    model_id = data.get("model_id")
+    model_id = normalize_model_id(data.get("model_id"))
     if model_id not in MODELS:
         raise HTTPException(status_code=400, detail=f"Invalid model_id: {model_id}")
     manager.active_model_id = model_id
@@ -470,7 +478,9 @@ async def add_custom_model(req: Request):
 @app_manager.post("/api/kaggle/launch")
 async def launch_kaggle(req: Request):
     data = await req.json() if req.headers.get("content-length", "0") != "0" else {}
-    model_id = data.get("model_id", manager.active_model_id)
+    model_id = normalize_model_id(data.get("model_id", manager.active_model_id))
+    if data.get("accelerator_mode") in {"gpu", "tpu"}:
+        manager.accelerator_mode = data["accelerator_mode"]
     if model_id not in MODELS:
         raise HTTPException(status_code=400, detail="Invalid model_id")
     import asyncio
@@ -713,6 +723,8 @@ async def list_models(request: Request):
             "permission": [], "root": model["id"], "parent": None,
             "context_length": context, "context_window": context, "max_model_len": context,
             "max_context_length": context, "max_position_embeddings": context,
+            "supported_accelerators": model.get("supported_accelerators", []),
+            "default_accelerator": model.get("default_accelerator", "gpu"),
         })
     return {"object": "list", "data": data}
 

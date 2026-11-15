@@ -35,6 +35,7 @@ class KaggleAccountPool:
         now = time.time()
         return {
             "id": uuid.uuid4().hex[:12], "username": username, "key": key, "proxy": proxy or "server",
+            "proxy_override": bool(proxy and proxy not in {"default", "server"}),
             "assigned_proxy_url": "", "last_exit_ip": "",
             "status": status, "verified_at": 0.0, "verification_error": "", "created_at": now,
             "updated_at": now, "cooldown_until": 0.0, "last_error": "", "quota_window_started_at": 0.0,
@@ -82,6 +83,10 @@ class KaggleAccountPool:
             defaults = self._new_account(username, key, str(raw.get("proxy") or "server"), status)
             account = {**defaults, **raw, "id": account_id, "username": username, "key": key, "status": status}
             account["proxy"] = str(account.get("proxy") or "server").strip() or "server"
+            if "proxy_override" not in raw:
+                account["proxy_override"] = account["proxy"] not in {"default", "server", "webshare"}
+            else:
+                account["proxy_override"] = bool(raw.get("proxy_override"))
             for field in (
                 "verified_at", "created_at", "updated_at", "cooldown_until", "quota_window_started_at",
                 "gpu_used_seconds", "tpu_used_seconds", "session_started_at", "last_session_seconds", "last_boot_seconds",
@@ -213,6 +218,7 @@ class KaggleAccountPool:
                 result.append({
                     "id": account["id"], "queue_position": index + 1, "username": account["username"],
                     "proxy": self._public_proxy(account["proxy"]), "status": account["status"],
+                    "proxy_override": bool(account.get("proxy_override")),
                     "proxy_mode": account["proxy"] if account["proxy"] in {"default", "webshare", "server"} else "custom",
                     "assigned_proxy": self._public_proxy(account.get("assigned_proxy_url", "")),
                     "last_exit_ip": account.get("last_exit_ip") or "",
@@ -253,6 +259,7 @@ class KaggleAccountPool:
             if duplicate:
                 duplicate.update({
                     "key": key, "proxy": proxy, "status": status or "VERIFYING", "verified_at": 0.0,
+                    "proxy_override": proxy not in {"default", "server"},
                     "assigned_proxy_url": "", "last_exit_ip": "",
                     "verification_error": "", "last_error": "", "updated_at": time.time(),
                 })
@@ -280,12 +287,15 @@ class KaggleAccountPool:
         proxy: str,
         assigned_proxy_url: str = "",
         last_exit_ip: str = "",
+        proxy_override: Optional[bool] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             account = next((item for item in self._data["accounts"] if item["id"] == account_id), None)
             if not account:
                 raise KeyError(account_id)
             account["proxy"] = str(proxy or "server").strip() or "server"
+            if proxy_override is not None:
+                account["proxy_override"] = bool(proxy_override)
             account["assigned_proxy_url"] = str(assigned_proxy_url or "").strip()
             account["last_exit_ip"] = str(last_exit_ip or "").strip()
             account["updated_at"] = time.time()

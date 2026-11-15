@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from fastapi import HTTPException
@@ -125,12 +125,13 @@ class LifecycleTests(unittest.TestCase):
         manager = km.KaggleKernelManager()
         manager.client_api_key = "sk-test-123456789"
         manager.upstream_api_key = manager.client_api_key
-        manager.resolve_kernel_identity = lambda force=False, model_id=None, account_id=None: ("friend", "qwen38-tpu-serve", "Qwen38 TPU")
+        manager.accelerator_mode = "tpu"
+        manager.resolve_kernel_identity = lambda force=False, model_id=None, account_id=None, accelerator=None: ("friend", "qwen38-tpu-serve", "Qwen38 TPU")
         old_runtime = km.RUNTIME_BUNDLE_DIR
         old_custom = registry.CUSTOM_MODELS_PATH
         with tempfile.TemporaryDirectory() as directory:
             km.RUNTIME_BUNDLE_DIR = Path(directory) / "bundles"
-            session = km.KernelSession("qwen", "test", "account", "qwen3.8-27b-tpu", "tpu")
+            session = km.KernelSession("qwen", "test", "account", "qwen3.8-27b-instruct", "tpu")
             bundle = manager._prepare_session_bundle(session)
             metadata = json.loads((bundle / "kernel-metadata.json").read_text())
             self.assertTrue(metadata["enable_tpu"])
@@ -186,6 +187,52 @@ class LifecycleTests(unittest.TestCase):
             self.assertTrue(result["success"])
             self.assertEqual(run.call_count, 2)
             self.assertEqual(manager.sessions[result["session_id"]].kernel_slug, "user1/gpu-engine")
+
+    def test_non_default_gpu_model_uses_model_specific_kernel_slug(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool, ids = make_pool(Path(directory), 1)
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            manager.fetch_existing_kernels = lambda force=False, account_id=None: [
+                {"ref": "user1/gpu-engine", "slug": "gpu-engine", "title": "GPU Engine", "owner": "user1"}
+            ]
+            owner, slug, title = manager.resolve_kernel_identity(
+                force=True,
+                model_id="qwen3.8-35b-a3b-distill",
+                account_id=ids[0],
+                accelerator="gpu",
+            )
+            self.assertEqual(owner, "user1")
+            self.assertEqual(slug, "gpu-hub-qwen3-8-35b-a3b-distill")
+            self.assertEqual(title, "GPU Hub qwen3.8-35b-a3b-distill")
+            self.assertLessEqual(len(title), 50)
+
+    def test_non_default_409_never_adopts_unrelated_legacy_gpu_kernel(self):
+        manager = km.KaggleKernelManager()
+        session = km.KernelSession("qwen", "active", "account", "qwen3.8-35b-a3b-distill", "gpu")
+        session.kernel_slug = "user1/gpu-hub-qwen3-8-35b-a3b-distill"
+        manager.fetch_existing_kernels = lambda force=False, account_id=None: [
+            {"ref": "user1/gpu-engine", "slug": "gpu-engine", "title": "GPU Engine", "owner": "user1"}
+        ]
+        self.assertFalse(manager._adopt_conflicting_kernel(session, "409 Conflict: user1/gpu-engine already has an active session"))
+
+    def test_cancelled_kernel_status_short_circuits_slow_log_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool, ids = make_pool(Path(directory), 1)
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            manager.auto_key_rotation = False
+            session = km.KernelSession("cancel", "active", ids[0], "qwen3.8-35b-a3b-distill", "gpu")
+            session.kernel_slug = "user1/gpu-hub-qwen3-8-35b-a3b-distill"
+            manager.sessions[session.id] = session
+            manager.warming_session_id = session.id
+            session.stop_event.wait = MagicMock(return_value=False)
+            result = MagicMock(returncode=0, stdout='status "KernelWorkerStatus.CANCEL_ACKNOWLEDGED"', stderr="")
+            manager._run_kaggle = MagicMock(return_value=result)
+            manager._read_session_logs = MagicMock(side_effect=AssertionError("slow log probe should not run"))
+            manager._monitor_session(session)
+            self.assertEqual(session.status, "failed")
+            manager._read_session_logs.assert_not_called()
 
     def test_prewarm_trigger_and_atomic_swap(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -333,6 +380,7 @@ class LifecycleTests(unittest.TestCase):
                 stderr = ""
 
             manager._prepare_session_bundle = prepare
+            manager.accelerator_mode = "tpu"
             manager._monitor_session = lambda session: None
             manager._delete_kernel_for_fresh_tpu = MagicMock()
             manager._run_kaggle = MagicMock(return_value=Result())
@@ -347,9 +395,11 @@ class LifecycleTests(unittest.TestCase):
         manager.webhook_host = "https://manager.example"
         source = manager.generate_kernel_script("cybertiel-coder-35b-a3b", "session-id", "active")
         self.assertIn('https://manager.example/api/tunnel/register', source)
-        self.assertIn('json.dumps({"tunnel_url": tunnel_url', source)
+        self.assertIn('payload = json.dumps({"tunnel_url": url', source)
         self.assertNotIn('json.dumps({{"tunnel_url"', source)
-        self.assertIn('IDLE_TIMEOUT_MIN={IDLE_TIMEOUT_MIN}', source)
+        self.assertIn('b12395', source)
+        self.assertIn('resolve_gguf_filename', source)
+        self.assertIn('[SUPERVISOR]', source)
         compile(source, "<generated-gpu-kernel>", "exec")
 
     def test_live_log_fallback_samples_follow_stream_for_cli_224(self):
@@ -371,6 +421,18 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(any("example.trycloudflare.com" in line for line in lines))
         self.assertFalse(idle)
         self.assertEqual(failure, "")
+
+    def test_recovering_tunnel_never_reports_fake_ready(self):
+        manager = km.KaggleKernelManager()
+        session = km.KernelSession("live", "active", "account", "cybertiel-coder-35b-a3b", "gpu", tunnel_url="https://dead.test", status="ready")
+        manager.sessions = {session.id: session}
+        manager.active_session_id = session.id
+        manager.tunnel_url = session.tunnel_url
+        manager.status = "recovering"
+        manager.status_detail = "health checks failed"
+        state = manager.get_state()
+        self.assertEqual(state["status"], "recovering")
+        self.assertNotEqual(state["status"], "ready")
 
     def test_no_tpu_recreates_without_cooldown_or_circuit_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -421,6 +483,105 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("AUTO-SWITCHING &AMP; NETWORK SHIELD", html.upper())
         self.assertIn("KAGGLE API KEY POOL", html.upper())
 
+    def test_conditional_route_and_accelerator_controls_are_custom(self):
+        html = (Path(__file__).parents[1] / "static" / "index.html").read_text()
+        for marker in ("webshareShield", "customProxyShield", "applyRouteVisibility", "acceleratorMode", "setAcceleratorMode"):
+            self.assertIn(marker, html)
+        self.assertIn("Requires TPU v5e-8", html)
+        self.assertIn("Requires Dual T4 GPU", html)
+
+
+class V5RouteAndModelTests(unittest.TestCase):
+    def test_fresh_webshare_connect_assigns_inherited_accounts_then_server_clears_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool, ids = make_pool(Path(directory), 1)
+            pool.update_proxy(ids[0], "default", proxy_override=False)
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            manager.webshare = MagicMock()
+            manager.webshare.connect.return_value = {"connected": True, "proxy_count": 1, "exit_ip": "10.0.0.2"}
+            manager.webshare.proxy_count.return_value = 1
+            manager.webshare.proxy_for_index.return_value = {"proxy_url": "http://proxy:8000"}
+            manager.webshare.test_proxy.return_value = "10.0.0.2"
+            connected = manager.connect_webshare("token")
+            self.assertTrue(connected["connected"])
+            self.assertEqual(manager.default_network_route, "webshare")
+            account = pool.get(ids[0])
+            self.assertFalse(account["proxy_override"])
+            self.assertEqual(account["assigned_proxy_url"], "http://proxy:8000")
+            manager.set_default_network_route("server")
+            account = pool.get(ids[0])
+            self.assertEqual(account["proxy"], "default")
+            self.assertFalse(account["proxy_override"])
+            env = manager.get_subprocess_env(ids[0])
+            self.assertNotIn("HTTP_PROXY", env)
+            self.assertNotIn("ALL_PROXY", env)
+
+    def test_explicit_custom_override_survives_default_route_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool, ids = make_pool(Path(directory), 1)
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            manager.webshare = MagicMock()
+            manager.webshare.test_proxy.return_value = "10.1.1.1"
+            manager.update_account_proxy(ids[0], "http://proxy:9000")
+            manager.set_default_network_route("server")
+            account = pool.get(ids[0])
+            self.assertTrue(account["proxy_override"])
+            self.assertEqual(account["proxy"], "http://proxy:9000")
+
+    def test_registry_accelerator_contract_and_tpu_machine_shape(self):
+        for model in registry.MODELS.values():
+            self.assertTrue(model.get("supported_accelerators"))
+            self.assertIn(model.get("default_accelerator"), model["supported_accelerators"])
+        manager = km.KaggleKernelManager()
+        manager.accelerator_mode = "gpu"
+        self.assertFalse(manager.model_is_compatible("glm-5.3-flash"))
+        self.assertTrue(manager.model_is_compatible("qwen3.8-27b-instruct"))
+        manager.accelerator_mode = "tpu"
+        self.assertTrue(manager.model_is_compatible("qwen3.8-27b-instruct"))
+        with tempfile.TemporaryDirectory() as directory:
+            old_runtime = km.RUNTIME_BUNDLE_DIR
+            km.RUNTIME_BUNDLE_DIR = Path(directory)
+            manager.client_api_key = manager.upstream_api_key = "test-key"
+            manager.resolve_kernel_identity = lambda **kwargs: ("friend", "qwen38-tpu-serve", "Qwen TPU")
+            session = km.KernelSession("s", "test", "account", "qwen3.8-27b-instruct", "tpu")
+            bundle = manager._prepare_session_bundle(session)
+            metadata = json.loads((bundle / "kernel-metadata.json").read_text())
+            self.assertTrue(metadata["enable_tpu"])
+            self.assertFalse(metadata["enable_gpu"])
+            self.assertEqual(metadata["machine_shape"], "TpuV5E8")
+            km.RUNTIME_BUNDLE_DIR = old_runtime
+
+    def test_huggingface_registry_files_and_dynamic_resolver(self):
+        client = httpx.Client(timeout=30, trust_env=False)
+        try:
+            for model in registry.MODELS.values():
+                if "gpu" not in model.get("supported_accelerators", []) or model.get("custom"):
+                    continue
+                response = client.get(f"https://huggingface.co/api/models/{model['gpu_repo_id']}")
+                self.assertEqual(response.status_code, 200, model["gpu_repo_id"])
+                siblings = [item.get("rfilename", "") for item in response.json().get("siblings", [])]
+                resolved = registry.resolve_gguf_filename(model["gpu_filename"], siblings)
+                self.assertIn(resolved, siblings)
+                self.assertTrue(resolved.lower().endswith(".gguf"))
+        finally:
+            client.close()
+
+    def test_every_gpu_registry_model_generates_a_compilable_kernel(self):
+        manager = km.KaggleKernelManager()
+        manager.client_api_key = manager.upstream_api_key = "test-key"
+        for model_id, model in registry.MODELS.items():
+            if "gpu" not in model.get("supported_accelerators", []) or model.get("custom"):
+                continue
+            source = manager.generate_kernel_script(model_id, f"test-{model_id}", "test", "gpu")
+            compile(source, f"<{model_id}-kernel>", "exec")
+            self.assertIn(model["gpu_repo_id"], source)
+            self.assertIn("resolve_gguf_filename", source)
+            self.assertIn('llama_build = "b12395"', source)
+            self.assertIn('"--host", "127.0.0.1", "--port", "8080"', source)
+            self.assertIn('"--protocol", "http2", "--edge-ip-version", "4"', source)
+
 
 class ProxyQueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_warmup_status_headers(self):
@@ -449,6 +610,9 @@ class ProxyQueueTests(unittest.IsolatedAsyncioTestCase):
                 self.queued_requests = 0
                 self.active_requests = 0
                 self.counts = {}
+
+            def model_spec(self, model_id):
+                return {"max_concurrency": 1, "context_length": 65536}
 
             def note_request_queued(self):
                 self.queued_requests += 1
@@ -489,6 +653,52 @@ class ProxyQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(max_active, 1)
         self.assertEqual(manager.active_requests, 0)
         self.assertEqual(manager.queued_requests, 0)
+
+    async def test_model_normalization_context_clamp_and_transient_retry(self):
+        class Manager:
+            active_model_id = "qwen3.8-35b-a3b-distill"
+            tunnel_url = "https://old.test"
+            upstream_api_key = "key"
+            status = "ready"
+            status_detail = ""
+
+            def __init__(self):
+                self.queued_requests = 0
+                self.active_requests = 0
+
+            def model_spec(self, model_id):
+                return {"max_concurrency": 1, "context_length": 1024}
+
+            def note_request_queued(self): self.queued_requests += 1
+            def note_request_aborted(self): self.queued_requests = max(0, self.queued_requests - 1)
+            def reserve_upstream(self):
+                self.queued_requests -= 1; self.active_requests += 1
+                return self.tunnel_url
+            def release_upstream(self, url): self.active_requests -= 1
+            def warmup_headers(self): return {}
+
+        manager = Manager()
+        attempts = []
+
+        async def handler(request):
+            attempts.append(json.loads(request.content.decode()))
+            if len(attempts) < 3:
+                return httpx.Response(503, json={"error": "restarting"})
+            return httpx.Response(200, json={"ok": True})
+
+        proxy = InferenceProxy(manager, MODELS, lambda: "key", lambda: False, lambda body: {}, lambda: False)
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch("proxy_service.asyncio.sleep", new_callable=AsyncMock):
+            response = await proxy.raw_proxy("/v1/chat/completions", {
+                "model": "wrong-client-alias", "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 999999,
+            }, False)
+        await proxy._client.aclose()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue(all(item["model"] == manager.active_model_id for item in attempts))
+        self.assertTrue(all(1 <= item["max_tokens"] < 1024 for item in attempts))
+        self.assertEqual(manager.active_requests, 0)
 
 
 if __name__ == "__main__":

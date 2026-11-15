@@ -56,15 +56,22 @@ Kaggle credentials only contact Kaggle through their selected network route. Inf
 
 ## Hardware and model matrix
 
-| Profile | Free accelerator | Memory | Model shape | Quantization | Context | Typical output speed* |
-|---|---|---:|---|---|---:|---:|
-| Qwen3.8-Flash-Next preview | TPU v5e-8 | 128 GB HBM | 180B footprint, 6B active | External sub-4-bit recipe required | 262,144 | Recipe-dependent |
-| GLM-5.3-Flash | TPU v5e-8 | 128 GB HBM | 320B MoE, 18B active | 3-bit experts / int8 | 262,144 | ~165 tok/s |
-| Qwen3.8-27B | TPU v5e-8 | 128 GB HBM | 27B dense | BF16 + MTP | 262,144 | ~130 tok/s single, ~540 tok/s at 8 streams |
-| CyberTiel-Coder-35B-A3B | Dual Tesla T4 | 32 GB GDDR6 | 35B MoE, ~3.4B active | UD-Q4_K_XL | 262,144 | 40–55 tok/s |
-| Qwen3.8-27B-Instruct | Dual Tesla T4 | 32 GB GDDR6 | 27B dense | Q4_K_M | 262,144 | 28–35 tok/s |
-| Qwen2.5-Coder-32B | Dual Tesla T4 | 32 GB GDDR6 | 32.5B dense | Q4_K_M | 131,072 | 20–25 tok/s |
-| Llama-3.3-70B | Dual Tesla T4 | 32 GB GDDR6 | 70.6B dense | IQ3_M | 65,536 | 8–12 tok/s |
+Choose the accelerator first. The model selector marks incompatible profiles as disabled, and the launch button explains which hardware mode is required.
+
+| Profile | Accelerator | Model shape | Quantization | Context | Typical output speed* |
+|---|---|---|---|---:|---:|
+| Cyber-Tiel-Coder-35B-A3B | Dual T4 · 32 GB | 35B MoE, ~3.4B active | UD-Q4_K_XL | 262,144 | 40–55 tok/s |
+| Qwen3.8-35B-A3B-Distill | Dual T4 · 32 GB | 35B MoE, ~3B active | Q4_K_M | 262,144 | 45–65 tok/s |
+| Qwen3.8-27B-Instruct | Dual T4 or TPU v5e-8 | 27B dense | UD-Q4_K_XL GPU / BF16 TPU | 262,144 | 28–35 GPU / ~130 TPU |
+| Qwen3.6-35B-A3B-Uncensored | Dual T4 · 32 GB | 35B MoE, ~3B active | Q4_K_M | 262,144 | 40–60 tok/s |
+| Gemma-4-26B-A4B-IT | Dual T4 · 32 GB | 26B MoE, ~4B active | UD-Q4_K_XL | 262,144 | 45–70 tok/s |
+| Gemma-4-31B-IT | Dual T4 · 32 GB | 31B dense | UD-Q4_K_XL | 262,144 | 22–32 tok/s |
+| DeepSeek-V4-Pro-Qwen3.5-9B-Heretic | Dual T4 · 32 GB | 9B hybrid | Q4_K_M | 131,072 | 80+ tok/s |
+| DeepSeek-R1-Distill-Qwen-32B | Dual T4 · 32 GB | 32B dense | Q4_K_M | 131,072 | 18–25 tok/s |
+| Qwen2.5-Coder-32B Abliterated | Dual T4 · 32 GB | 32.5B dense | Q4_K_M | 131,072 | 20–25 tok/s |
+| Llama-3.3-70B Abliterated | Dual T4 · 32 GB | 70.6B dense | IQ3_M | 65,536 | 8–12 tok/s |
+| GLM-5.3-Flash | TPU v5e-8 · 128 GB | 320B MoE, 18B active | 3-bit experts / int8 | 262,144 | ~165 tok/s |
+| Qwen3.8-Flash-Next compatibility profile | TPU v5e-8 · 128 GB | 180B footprint, ~6B active | External sub-4-bit recipe required | 262,144 | Recipe-dependent |
 
 \*Measured speed depends on Kaggle allocation, prompt length, cache state, and concurrency. The GLM and Qwen TPU recipes are derived from the MIT-licensed [`ARahim3/kaggle-tpu-lab`](https://github.com/ARahim3/kaggle-tpu-lab) workflows vendored under `tpu_lab/`.
 
@@ -135,6 +142,8 @@ Optional but recommended for a multi-account pool:
 
 Then choose a model and press **Launch Model**. Large TPU recipes usually need 6–15 minutes; Dual T4 profiles usually need 4–5 minutes.
 
+The default hardware mode is **Dual T4 GPU**. Switch the segmented hardware control to **TPU v5e-8** before choosing a TPU-only profile. Dual-capable Qwen3.8-27B automatically selects the matching GGUF or TPU runner.
+
 ## Client configuration
 
 ### OpenAI SDK and OpenCode-compatible tools
@@ -187,6 +196,12 @@ Choose an OpenAI-compatible provider and enter:
 TPU recipes use an additional recovery path. GPU Hub deletes any stale TPU kernel before launch so Kaggle must create a new VM. If JAX reports a CPU-only allocation, GPU Hub keeps the same timer and account, deletes the failed slug, increments it to `-r1` through `-r4`, waits ten seconds, and re-pushes. These allocation glitches never count as invalid keys, account cooldowns, or circuit-breaker failures.
 
 With one key, GPU Hub never opens a duplicate session on the same account. It stops at the session boundary, waits a 20-second safety buffer, and restarts only when weekly quota remains.
+
+## Runtime self-healing
+
+The Kaggle kernel supervises both serving processes every ten seconds. Two failed local health checks restart `llama-server` in place with safe Dual T4 flags. A dead or unreachable Cloudflare process is respawned, its new tunnel URL is registered with GPU Hub, and clients continue through the stable controller endpoint.
+
+The controller probes the active tunnel every twenty seconds. It samples Kaggle logs for a rotated tunnel after two failures and leaves `READY` immediately when the upstream is unavailable. If the Kaggle kernel has stopped, automatic rotation relaunches on the next verified account. Inference requests normalize client model aliases to the active upstream model, clamp oversized token budgets to the active context window, and retry transient 502/503/504 or connection-reset failures three times while the supervisor recovers.
 
 ## Webshare zero-leak proxy shield
 
@@ -246,6 +261,7 @@ Copy the provided `*.example.json` files only when you need a starting template.
 
 ```bash
 python3 -m py_compile app.py account_pool.py kaggle_manager.py proxy_service.py models_registry.py webshare_manager.py
+pytest -q
 python3 -m unittest discover -s tests -v
 ```
 

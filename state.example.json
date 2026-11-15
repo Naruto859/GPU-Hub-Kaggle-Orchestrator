@@ -7,5 +7,6 @@
   "auto_wake": true,
   "auto_key_rotation": true,
   "default_network_route": "server",
-  "default_custom_proxy": ""
+  "default_custom_proxy": "",
+  "accelerator_mode": "gpu"
 }
