@@ -2586,6 +2586,23 @@ while True:
         session_id = str(account.get("session_id") or uuid.uuid4().hex[:12])
         launch_time = float(account.get("session_started_at") or self.launch_time or time.time())
         slug = "qwen38-tpu-serve" if workflow == "qwen38_tpu" else "glm53-tpu-serve" if accelerator == "tpu" else CANONICAL_GPU_SLUG
+        kernel_slug = f"{account['username']}/{slug}"
+        kernel_title = "Qwen38 TPU Serve" if workflow == "qwen38_tpu" else "GLM53 TPU Serve" if accelerator == "tpu" else CANONICAL_GPU_TITLE
+        bundle_dir = RUNTIME_BUNDLE_DIR / session_id
+        relay_token = ""
+        try:
+            metadata_path = bundle_dir / "kernel-metadata.json"
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                kernel_slug = str(metadata.get("id") or kernel_slug)
+                kernel_title = str(metadata.get("title") or kernel_title)
+            source_path = bundle_dir / "kernel.py"
+            if self.tunnel_url.startswith("relay://") and source_path.exists():
+                token_match = re.search(r'^RELAY_TOKEN = (".*")$', source_path.read_text(encoding="utf-8"), re.M)
+                if token_match:
+                    relay_token = str(json.loads(token_match.group(1)) or "")
+        except Exception as exc:
+            self.log(f"Could not restore exact persisted bundle identity for {session_id}: {exc}")
         session = KernelSession(
             id=session_id,
             role="active",
@@ -2593,12 +2610,14 @@ while True:
             model_id=self.active_model_id,
             accelerator=accelerator,
             launch_time=launch_time,
-            kernel_slug=f"{account['username']}/{slug}",
-            kernel_title="Qwen38 TPU Serve" if workflow == "qwen38_tpu" else "GLM53 TPU Serve" if accelerator == "tpu" else CANONICAL_GPU_TITLE,
+            kernel_slug=kernel_slug,
+            kernel_title=kernel_title,
+            bundle_dir=bundle_dir if bundle_dir.exists() else None,
             tunnel_url=self.tunnel_url.rstrip("/"),
             status="ready",
             ready_time=time.time(),
             status_detail="Recovered from persisted GPU Hub state after service restart.",
+            relay_token=relay_token,
         )
         with self._state_lock:
             self.sessions[session.id] = session

@@ -726,10 +726,13 @@ async def relay_register(request: Request):
 async def relay_poll(request: Request):
     data = await request.json()
     session_id = str(data.get("session_id") or "")
-    if not _relay_authorized(request, session_id) or not relay_hub.authenticate(
-        session_id, request.headers.get("authorization", "")[7:].strip()
-    ):
+    if not _relay_authorized(request, session_id):
         raise HTTPException(status_code=401, detail="Invalid relay session token")
+    supplied = request.headers.get("authorization", "")[7:].strip()
+    if not relay_hub.authenticate(session_id, supplied):
+        session = manager._session_by_id(session_id)
+        relay_hub.register(session_id, session.relay_token)
+        manager.register_session_relay(session_id)
     job = await relay_hub.poll(session_id, float(data.get("timeout") or 20))
     if not job:
         return Response(status_code=204)
@@ -740,10 +743,13 @@ async def relay_poll(request: Request):
 async def relay_result(request: Request):
     data = await request.json()
     session_id = str(data.get("session_id") or "")
-    if not _relay_authorized(request, session_id) or not relay_hub.authenticate(
-        session_id, request.headers.get("authorization", "")[7:].strip()
-    ):
+    if not _relay_authorized(request, session_id):
         raise HTTPException(status_code=401, detail="Invalid relay session token")
+    supplied = request.headers.get("authorization", "")[7:].strip()
+    if not relay_hub.authenticate(session_id, supplied):
+        session = manager._session_by_id(session_id)
+        relay_hub.register(session_id, session.relay_token)
+        manager.register_session_relay(session_id)
     accepted = relay_hub.resolve(
         session_id, str(data.get("job_id") or ""), int(data.get("status_code") or 502),
         data.get("headers") or {}, str(data.get("body_b64") or ""),
