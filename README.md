@@ -16,7 +16,7 @@
 
 </div>
 
-GPU Hub launches model-serving kernels on Kaggle, discovers their temporary Cloudflare tunnels, and hides those changing URLs behind a permanent bearer-authenticated endpoint on your own server. OpenCode, Cursor, Cline, Roo Code, SillyTavern, Claude-compatible tools, and ordinary OpenAI SDKs keep using the same address while GPU Hub verifies keys, tracks quota, pre-warms the next account, drains in-flight requests, and swaps upstreams.
+GPU Hub launches model-serving kernels on Kaggle and connects them through an authenticated outbound request relay, with restricted reverse SSH and Cloudflare available as legacy fallbacks. The relay keeps the worker free of inbound tunnel processes while the permanent bearer-authenticated endpoint stays on your own server. OpenCode, Cursor, Cline, Roo Code, SillyTavern, Claude-compatible tools, and ordinary OpenAI SDKs keep using the same address while GPU Hub verifies keys, tracks quota, pre-warms the next account, drains in-flight requests, and swaps upstreams.
 
 > This project automates infrastructure you control. Follow Kaggle, Webshare, Cloudflare, model, and network-provider terms. Only add accounts and proxies you are authorized to use.
 
@@ -46,13 +46,13 @@ flowchart LR
     B --> KB[Kaggle account B\nDual T4 or TPU v5e-8]
     W[Webshare / custom proxy] -->|strict routed Kaggle API + CLI| KA
     W -->|new or distinct exit IP| KB
-    KA --> CFA[Cloudflare Quick Tunnel]
-    KB --> CFB[Cloudflare Quick Tunnel]
-    CFA --> S
-    CFB --> S
+    KA --> RA[Authenticated outbound relay A]
+    KB --> RB[Authenticated outbound relay B]
+    RA --> S
+    RB --> S
 ```
 
-Kaggle credentials only contact Kaggle through their selected network route. Inference traffic uses the already-established Cloudflare tunnel and does not touch Kaggle APIs.
+Kaggle credentials only contact Kaggle through their selected network route. Inference jobs travel over a separate per-session authenticated outbound relay and do not touch Kaggle APIs. The public relay listener exposes no dashboard or client API routes.
 
 ## Hardware and model matrix
 
@@ -62,7 +62,7 @@ Choose the accelerator first. The model selector marks incompatible profiles as 
 |---|---|---|---|---:|---:|
 | Cyber-Tiel-Coder-35B-A3B | Dual T4 · 32 GB | 35B MoE, ~3.4B active | UD-Q4_K_XL | 262,144 | 40–55 tok/s |
 | Qwen3.8-35B-A3B-Distill | Dual T4 · 32 GB | 35B MoE, ~3B active | Q4_K_M | 262,144 | 45–65 tok/s |
-| Qwen3.8-27B-Instruct | Dual T4 or TPU v5e-8 | 27B dense | UD-Q4_K_XL GPU / BF16 TPU | 262,144 | 28–35 GPU / ~130 TPU |
+| Qwen3.8-27B-Instruct | Dual T4 · 32 GB | 27B dense | UD-Q4_K_XL | 262,144 advertised / 32,768 runtime | 28–35 tok/s |
 | Qwen3.6-35B-A3B-Uncensored | Dual T4 · 32 GB | 35B MoE, ~3B active | Q4_K_M | 262,144 | 40–60 tok/s |
 | Gemma-4-26B-A4B-IT | Dual T4 · 32 GB | 26B MoE, ~4B active | UD-Q4_K_XL | 262,144 | 45–70 tok/s |
 | Gemma-4-31B-IT | Dual T4 · 32 GB | 31B dense | UD-Q4_K_XL | 262,144 | 22–32 tok/s |
@@ -105,6 +105,17 @@ sudo systemctl enable --now uncensored-manager.service
 curl http://127.0.0.1:8778/api/status
 ```
 
+Use the outbound relay when Kaggle cancels GPU workers shortly after `cloudflared` or reverse SSH starts. The relay listener exposes only authenticated worker registration, long-poll, and result routes; the dashboard and client API remain on localhost and Tailscale.
+
+```ini
+[Service]
+Environment=GPU_HUB_RELAY_BIND=0.0.0.0
+Environment=GPU_HUB_RELAY_PORT=8777
+Environment=GPU_HUB_RELAY_URL=http://<public-vps-ip-or-dns>:8777
+```
+
+Every launch receives a random relay token that is held in memory and embedded only in that private Kaggle kernel version. Client requests remain on `http://<tailscale-ip>:8778/v1`; the worker polls the relay outbound, runs the request locally against `llama-server`, and posts the exact response back. If relay variables are omitted, GPU Hub can use restricted per-session reverse SSH and then Cloudflare Quick Tunnels as fallbacks.
+
 For a quick foreground run:
 
 ```bash
@@ -142,7 +153,7 @@ Optional but recommended for a multi-account pool:
 
 Then choose a model and press **Launch Model**. Large TPU recipes usually need 6–15 minutes; Dual T4 profiles usually need 4–5 minutes.
 
-The default hardware mode is **Dual T4 GPU**. Switch the segmented hardware control to **TPU v5e-8** before choosing a TPU-only profile. Dual-capable Qwen3.8-27B automatically selects the matching GGUF or TPU runner.
+The default hardware mode is **Dual T4 GPU**. Switch the segmented hardware control to **TPU v5e-8** before choosing a TPU-only profile. Qwen3.8-27B is exposed only on the verified Dual T4 GGUF path until a Kaggle TPU recipe returns a real HTTP 200 end to end.
 
 ## Client configuration
 
@@ -199,9 +210,9 @@ With one key, GPU Hub never opens a duplicate session on the same account. It st
 
 ## Runtime self-healing
 
-The Kaggle kernel supervises both serving processes every ten seconds. Two failed local health checks restart `llama-server` in place with safe Dual T4 flags. A dead or unreachable Cloudflare process is respawned, its new tunnel URL is registered with GPU Hub, and clients continue through the stable controller endpoint.
+The Kaggle kernel supervises serving processes every ten seconds. Two failed local health checks restart `llama-server` in place with safe Dual T4 flags. The primary outbound relay reconnects without restarting the model; restricted reverse SSH and Cloudflare transports retain their existing recovery paths when used as fallbacks. Clients continue using the stable Tailscale endpoint.
 
-The controller probes the active tunnel every twenty seconds. It samples Kaggle logs for a rotated tunnel after two failures and leaves `READY` immediately when the upstream is unavailable. If the Kaggle kernel has stopped, automatic rotation relaunches on the next verified account. Inference requests normalize client model aliases to the active upstream model, clamp oversized token budgets to the active context window, and retry transient 502/503/504 or connection-reset failures three times while the supervisor recovers.
+The controller checks relay heartbeats or the active tunnel every twenty seconds. It leaves `READY` immediately when the upstream is unavailable. If the Kaggle kernel has stopped, automatic rotation relaunches on the next verified account. Inference requests normalize client model aliases to the active upstream model, clamp oversized token budgets to the active context window, and retry transient 502/503/504 or connection-reset failures three times while the supervisor recovers.
 
 ## Webshare zero-leak proxy shield
 
@@ -212,7 +223,7 @@ Protected routes use these invariants:
 - Failure produces `PROXY_ERROR`; there is no direct VPS fallback.
 - With multiple Webshare proxies, accounts are pinned to distinct verified exit IPs.
 - With one rotatable proxy, GPU Hub freezes Account A’s Kaggle status polling, refreshes the IP, waits five seconds, verifies the address changed, and only then authenticates Account B.
-- Tunnel A remains monitored through its Cloudflare `/v1/models` endpoint during the isolation window.
+- Tunnel A remains monitored through its inference `/v1/models` endpoint during the isolation window.
 - A local monthly ledger displays refreshes used out of 250 and resets at the UTC month boundary.
 
 ## Dashboard controls
@@ -270,7 +281,7 @@ Before publishing, scan the staged tree and verify runtime JSON files are absent
 ## Credits
 
 - [`ARahim3/kaggle-tpu-lab`](https://github.com/ARahim3/kaggle-tpu-lab) for the open TPU serving recipes.
-- Kaggle for hosted accelerators, Cloudflare for Quick Tunnels, Tailscale for private networking, and Webshare for optional proxy routing.
+- Kaggle for hosted accelerators, an authenticated outbound relay for primary transport, OpenSSH and Cloudflare as fallbacks, Tailscale for private networking, and Webshare for optional proxy routing.
 - llama.cpp, FastAPI, httpx, and the model authors listed in `models_registry.py`.
 
 ## License

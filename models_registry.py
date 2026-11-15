@@ -11,10 +11,23 @@ CUSTOM_MODELS_PATH = BASE_DIR / "custom_models.json"
 _CUSTOM_LOCK = threading.RLock()
 
 
-def gpu_args(context: int, parallel: int = 2) -> List[str]:
+def safe_gpu_runtime_context(advertised_context: int, filesize_gb: float = 0.0) -> int:
+    """Return a conservative Dual T4 runtime context without changing advertised model capability.
+
+    Kaggle exposes about 30 GiB of usable VRAM across two T4s. Long-context GGUF metadata can
+    advertise 128k-262k tokens, but allocating that KV cache beside 26B-70B weights is unsafe.
+    Unknown or large files therefore use 32k; only sub-12 GiB quants may use 64k.
+    """
+    advertised = max(2048, int(advertised_context or 32768))
+    size = float(filesize_gb or 0.0)
+    cap = 65536 if 0.0 < size < 12.0 else 32768
+    return min(advertised, cap)
+
+
+def gpu_args(runtime_context: int, parallel: int = 2) -> List[str]:
     return [
         "--host", "127.0.0.1", "--port", "8080",
-        "--parallel", str(parallel), "-c", str(context),
+        "--parallel", str(parallel), "-c", str(runtime_context),
         "--cache-type-k", "q4_0", "--cache-type-v", "q4_0",
         "-ngl", "99", "-sm", "layer", "-ts", "1,1",
         "-b", "2048", "-ub", "512", "-fa", "on", "--threads", "4",
@@ -23,19 +36,22 @@ def gpu_args(context: int, parallel: int = 2) -> List[str]:
 
 def gpu_model(model_id: str, name: str, repo: str, filename: str, parameters: str, context: int,
               rank: int, speed: str, quant: str = "UD-Q4_K_XL", filesize: float = 0.0,
-              description: str = "") -> Dict[str, Any]:
+              description: str = "", runtime_context: int = 0) -> Dict[str, Any]:
+    runtime_context = int(runtime_context or safe_gpu_runtime_context(context, filesize))
     return {
         "id": model_id, "name": name, "repo_id": repo, "filename": filename,
         "gpu_repo_id": repo, "gpu_filename": filename,
         "parameters": parameters, "quant": quant, "filesize_gb": filesize,
         "context_length": context, "context_display": f"{context:,} tokens",
+        "runtime_context_length": runtime_context,
+        "runtime_context_display": f"{runtime_context:,} tokens on Dual T4",
         "rope_scaling": "Native / model-defined long context", "kv_cache": "q4_0 / q4_0",
         "vram_requirement": "Dual Tesla T4 · 32 GB aggregate VRAM",
         "speed": speed, "accelerator": "gpu", "default_accelerator": "gpu",
         "supported_accelerators": ["gpu"], "hardware": "Dual Tesla T4",
         "hardware_detail": "2 × 16 GB GDDR6 (32 GB total)",
         "runtime": "latest llama.cpp CUDA · layer split 1,1", "max_concurrency": 2,
-        "rank": rank, "description": description or name, "server_args": gpu_args(context),
+        "rank": rank, "description": description or name, "server_args": gpu_args(runtime_context),
     }
 
 
@@ -52,21 +68,12 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "35B MoE (~3B active)", 262144, 2, "45–65 tok/s", quant="Q4_K_M",
         description="Frontier agentic Qwen3.8 distill with low active-parameter latency.",
     ),
-    "qwen3.8-27b-instruct": {
-        **gpu_model(
-            "qwen3.8-27b-instruct", "Qwen3.8-27B-Instruct (Unsloth Dynamic V3.1 Agentic · 256k)",
-            "unsloth/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-            "27B dense", 262144, 3, "28–35 tok/s GPU · ~130 tok/s TPU", filesize=22.0,
-            description="Dual-capable Qwen3.8: Unsloth Dynamic GGUF on Dual T4 or BF16 vLLM runner on TPU v5e-8.",
-        ),
-        "supported_accelerators": ["gpu", "tpu"],
-        "default_accelerator": "gpu",
-        "tpu_kernel_workflow": "qwen38_tpu",
-        "tpu_repo_id": "Qwen/Qwen3.8-27B",
-        "tpu_dataset_sources": ["rahim3/qwen3-8-27b-bf16", "rahim3/qwen38-tpu-env-v5e8"],
-        "native_anthropic": False,
-        "max_concurrency_by_accelerator": {"gpu": 2, "tpu": 4},
-    },
+    "qwen3.8-27b-instruct": gpu_model(
+        "qwen3.8-27b-instruct", "Qwen3.8-27B-Instruct (Unsloth Dynamic V3.1 Agentic · 256k)",
+        "unsloth/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        "27B dense", 262144, 3, "28–35 tok/s GPU", filesize=22.0,
+        description="Verified GGUF launch path on Dual T4. TPU selection stays disabled until a complete TPU session reaches HTTP 200.",
+    ),
     "qwen3.6-35b-a3b-uncensored": gpu_model(
         "qwen3.6-35b-a3b-uncensored", "Qwen3.6-35B-A3B-Uncensored (HauhauCS 0-Refusal MoE)",
         "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive",

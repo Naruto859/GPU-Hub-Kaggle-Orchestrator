@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # Autonomous Uncensored AI Agent Kernel - Dual Tesla T4 / P100 Execution Engine
-# Model: Cyber-Tiel-Coder-35B-A3B (Uncensored Security & Coding MoE) (35B MoE (~3.4B active), UD-Q4_K_XL)
+# Model: Gemma-4-26B-A4B-IT (Google Agentic MoE · 256k) (26B MoE (~4B active), UD-Q4_K_XL)
 # Context Window: 262,144 tokens | RoPE: Native / model-defined long context | KV: q4_0 / q4_0
-# Hugging Face: peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF / Cyber-Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf
+# Hugging Face: unsloth/gemma-4-26B-A4B-it-GGUF / gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 # ==============================================================================
 
 import os
@@ -13,21 +13,31 @@ import subprocess
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 import re
+import base64
+import threading
 from pathlib import Path
 
 print("=" * 70)
 print("[ENGINE] Booting Autonomous Uncensored AI Engine on Kaggle...")
 print("=" * 70)
 
-MODEL_NAME = "Cyber-Tiel-Coder-35B-A3B (Uncensored Security & Coding MoE)"
-MODEL_REPO = "peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF"
-MODEL_FILENAME = "Cyber-Tiel-Coder-35B-A3B-UD-Q4_K_XL.gguf"
-MODEL_FILESIZE = 22.36
-MODEL_ID = "cybertiel-coder-35b-a3b"
-WEBHOOK_TARGET = "https://your-gpu-hub-callback.example/api/tunnel/register"
+MODEL_NAME = "Gemma-4-26B-A4B-IT (Google Agentic MoE \u00b7 256k)"
+MODEL_REPO = "unsloth/gemma-4-26B-A4B-it-GGUF"
+MODEL_FILENAME = "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf"
+MODEL_FILESIZE = 0.0
+MODEL_ID = "gemma-4-26b-a4b-it"
+WEBHOOK_TARGET = "http://127.0.0.1:8778/api/tunnel/register"
 GPU_HUB_SESSION_ID = ""
 GPU_HUB_SESSION_ROLE = "active"
+REVERSE_SSH_HOST = ""
+REVERSE_SSH_USER = "root"
+REVERSE_SSH_SERVER_PORT = 22
+REVERSE_SSH_REMOTE_PORT = 0
+REVERSE_SSH_PRIVATE_KEY_B64 = ""
+RELAY_URL = ""
+RELAY_TOKEN = ""
 
 # --- Auto-shutdown lifecycle timers (minutes) ----------------------------------
 # Injected at bundle-prep time from the dashboard settings (config.json), so
@@ -162,37 +172,89 @@ else:
 
 # Step 4: Launch llama-server with Dual-GPU offload
 print("\n[STEP 4] Launching llama-server in background with GPU offloading...")
-server_cmd = [
+base_server_cmd = [
     LLAMA_SERVER,
     "-m", model_path,
-    "--host", "127.0.0.1", "--port", "8080", "--parallel", "2", "-c", "262144", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0", "-ngl", "99", "-sm", "layer", "-ts", "1,1", "-b", "2048", "-ub", "512", "-fa", "on", "--threads", "4"
+    "--host", "127.0.0.1", "--port", "8080", "--parallel", "2", "-c", "32768", "--cache-type-k", "q4_0", "--cache-type-v", "q4_0", "-ngl", "99", "-sm", "layer", "-ts", "1,1", "-b", "2048", "-ub", "512", "-fa", "on", "--threads", "4"
 ]
 
-print("[SERVER CMD]:", " ".join(server_cmd))
-server_log = open("/tmp/llama_server.log", "w")
-server_proc = subprocess.Popen(server_cmd, stdout=server_log, stderr=subprocess.STDOUT)
-print(f"[SERVER] Process spawned with PID: {server_proc.pid}")
 
-# Poll health endpoint
-print("[SERVER] Waiting for model to load into VRAM...")
-ready = False
-for attempt in range(120):
-    time.sleep(3)
+def tail_server_log(limit=5000):
     try:
-        req = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2)
-        if req.status == 200:
-            print(f"\n[SERVER READY] Model is fully loaded and accepting requests on port 8080! (attempt {attempt+1})")
-            ready = True
+        return Path("/tmp/llama_server.log").read_text(errors="replace")[-limit:]
+    except Exception as exc:
+        return f"unable to read llama_server.log: {exc}"
+
+
+def set_arg(command, flag, value):
+    updated = list(command)
+    if flag in updated:
+        updated[updated.index(flag) + 1] = str(value)
+    return updated
+
+
+# Primary profile preserves fast attention and two slots. If this particular GGUF
+# rejects a flag or exits during CUDA initialization, retry once with a smaller,
+# compatibility-focused profile instead of letting cloudflared expose a dead origin.
+compat_server_cmd = list(base_server_cmd)
+if "-fa" in compat_server_cmd:
+    index = compat_server_cmd.index("-fa")
+    del compat_server_cmd[index:index + 2]
+compat_server_cmd = set_arg(compat_server_cmd, "--parallel", 1)
+compat_server_cmd = set_arg(compat_server_cmd, "-c", 16384)
+compat_server_cmd = set_arg(compat_server_cmd, "-b", 512)
+compat_server_cmd = set_arg(compat_server_cmd, "-ub", 256)
+server_profiles = [("dual-t4-safe", base_server_cmd), ("compatibility", compat_server_cmd)]
+server_proc = None
+server_log = None
+server_cmd = base_server_cmd
+ready = False
+last_server_tail = ""
+
+for profile_index, (profile_name, candidate_cmd) in enumerate(server_profiles, start=1):
+    server_cmd = candidate_cmd
+    print(f"[SERVER PROFILE {profile_index}/{len(server_profiles)}] {profile_name}")
+    print("[SERVER CMD]:", " ".join(server_cmd))
+    if server_log:
+        try: server_log.close()
+        except Exception: pass
+    server_log = open("/tmp/llama_server.log", "w")
+    server_proc = subprocess.Popen(server_cmd, stdout=server_log, stderr=subprocess.STDOUT)
+    print(f"[SERVER] Process spawned with PID: {server_proc.pid}")
+    print("[SERVER] Waiting for model to load into VRAM...")
+    for attempt in range(180):
+        time.sleep(2)
+        if server_proc.poll() is not None:
             break
+        try:
+            req = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2)
+            if req.status == 200:
+                print(f"\n[SERVER READY] Model is fully loaded and accepting requests on port 8080! (attempt {attempt+1}, profile={profile_name})")
+                ready = True
+                break
+        except Exception:
+            if attempt % 5 == 0:
+                sys.stdout.write(".")
+                sys.stdout.flush()
+    if ready:
+        break
+    try: server_log.flush()
+    except Exception: pass
+    last_server_tail = tail_server_log()
+    exit_code = server_proc.poll()
+    print(f"\n[SERVER ATTEMPT FAILED] profile={profile_name} exit_code={exit_code}")
+    print(last_server_tail)
+    try:
+        if server_proc.poll() is None:
+            server_proc.terminate()
+            server_proc.wait(timeout=10)
     except Exception:
-        sys.stdout.write(".")
-        sys.stdout.flush()
+        try: server_proc.kill()
+        except Exception: pass
 
 if not ready:
-    print("\n[ERROR] Server failed to become ready within timeout. Tail log:")
-    server_log.flush()
-    with open("/tmp/llama_server.log") as f:
-        print(f.read()[-3000:])
+    failure = {"step": "llama-server", "cause": "all startup profiles failed", "tail": last_server_tail[-5000:]}
+    print("PHASE failed " + json.dumps(failure))
     sys.exit(1)
 
 # Step 4b: Launch Early-Ping Keepalive Bridge on port 8081
@@ -224,15 +286,15 @@ if not bridge_ready:
 # Step 5: Start Tunnel and self-healing supervisor
 print(f"\n[STEP 5] Setting up secure outbound tunnel to port {tunnel_target_port}...")
 cf_bin = "/tmp/bin/cloudflared"
-if not os.path.exists(cf_bin):
-    print("[TUNNEL] Downloading Cloudflare tunnel binary...")
-    subprocess.run(["curl", "-sL", "-o", cf_bin, "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"], check=True)
-    os.chmod(cf_bin, 0o755)
-
 cf_log_path = "/tmp/cloudflared.log"
 cf_proc = None
 cf_log = None
 tunnel_url = ""
+cf_protocols = ("auto", "http2", "quic")
+cf_protocol_index = 0
+ssh_proc = None
+ssh_log = None
+tunnel_mode = "cloudflare"
 
 
 def notify_tunnel(url, status="ready"):
@@ -247,8 +309,147 @@ def notify_tunnel(url, status="ready"):
         print(f"[WEBHOOK] Registration failed for {url}: {exc}")
 
 
+
+relay_thread = None
+
+def relay_post(path, payload, timeout=30):
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        RELAY_URL + path, data=data, method="POST",
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + RELAY_TOKEN},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status, response.read()
+
+def relay_worker():
+    global tunnel_url
+    while True:
+        try:
+            status, raw = relay_post("/poll", {"session_id": GPU_HUB_SESSION_ID, "timeout": 20}, timeout=30)
+            if status == 204 or not raw:
+                continue
+            job = json.loads(raw.decode("utf-8"))
+            job_id = str(job.get("id") or "")
+            path = str(job.get("path") or "/v1/chat/completions")
+            body = json.dumps(job.get("body") or {}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            for key, value in (job.get("headers") or {}).items():
+                if str(key).lower() in {"authorization", "x-api-key"}:
+                    headers[str(key)] = str(value)
+            local_request = urllib.request.Request(
+                "http://127.0.0.1:8081" + path, data=body, method="POST", headers=headers,
+            )
+            response_headers = {}
+            try:
+                with urllib.request.urlopen(local_request, timeout=610) as local_response:
+                    status_code = local_response.status
+                    response_body = local_response.read()
+                    response_headers["content-type"] = local_response.headers.get("content-type", "application/json")
+            except urllib.error.HTTPError as exc:
+                status_code = exc.code
+                response_body = exc.read()
+                response_headers["content-type"] = exc.headers.get("content-type", "application/json")
+            relay_post("/result", {
+                "session_id": GPU_HUB_SESSION_ID, "job_id": job_id,
+                "status_code": status_code, "headers": response_headers,
+                "body_b64": base64.b64encode(response_body).decode("ascii"),
+            }, timeout=30)
+        except Exception as exc:
+            print(f"[RELAY] Poll/request error: {exc}")
+            time.sleep(2)
+
+def spawn_outbound_relay():
+    global relay_thread, tunnel_url, tunnel_mode
+    if not RELAY_URL or not RELAY_TOKEN or not GPU_HUB_SESSION_ID:
+        return False
+    try:
+        status, _ = relay_post("/register", {
+            "session_id": GPU_HUB_SESSION_ID, "model_id": MODEL_ID,
+            "session_role": GPU_HUB_SESSION_ROLE,
+        }, timeout=15)
+        if status != 200:
+            return False
+    except Exception as exc:
+        print(f"[RELAY] Registration failed: {exc}")
+        return False
+    tunnel_mode = "relay"
+    tunnel_url = f"relay://{GPU_HUB_SESSION_ID}"
+    relay_thread = threading.Thread(target=relay_worker, daemon=True, name="gpu-hub-relay")
+    relay_thread.start()
+    print(f"[RELAY READY] session={GPU_HUB_SESSION_ID} endpoint={RELAY_URL}")
+    print(f"=== TUNNEL_URL: {tunnel_url} ===")
+    return True
+
+
+
+def spawn_reverse_ssh():
+    global ssh_proc, ssh_log, tunnel_url, tunnel_mode
+    if not REVERSE_SSH_HOST or not REVERSE_SSH_REMOTE_PORT or not REVERSE_SSH_PRIVATE_KEY_B64:
+        return False
+    try:
+        if ssh_proc is not None and ssh_proc.poll() is None:
+            ssh_proc.terminate()
+            try: ssh_proc.wait(timeout=5)
+            except Exception: ssh_proc.kill()
+    except Exception:
+        pass
+    key_path = "/tmp/gpu_hub_reverse_ssh_key"
+    Path(key_path).write_bytes(base64.b64decode(REVERSE_SSH_PRIVATE_KEY_B64))
+    os.chmod(key_path, 0o600)
+    ssh_log_path = "/tmp/reverse_ssh.log"
+    Path(ssh_log_path).write_text("")
+    ssh_log = open(ssh_log_path, "a")
+    command = [
+        "ssh", "-v", "-i", key_path, "-N", "-T", "-p", str(REVERSE_SSH_SERVER_PORT),
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null", "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+        "-R", f"127.0.0.1:{REVERSE_SSH_REMOTE_PORT}:127.0.0.1:{tunnel_target_port}",
+        f"{REVERSE_SSH_USER}@{REVERSE_SSH_HOST}",
+    ]
+    print(f"[TUNNEL] Starting restricted reverse SSH transport to {REVERSE_SSH_HOST}:{REVERSE_SSH_SERVER_PORT}.")
+    ssh_proc = subprocess.Popen(command, stdout=ssh_log, stderr=subprocess.STDOUT)
+    forward_confirmed = False
+    for _ in range(30):
+        time.sleep(0.5)
+        if ssh_proc.poll() is not None:
+            break
+        try:
+            ssh_log.flush()
+            ssh_debug = Path(ssh_log_path).read_text(errors="replace")
+            if "remote forward success" in ssh_debug or "forwarding_success: all expected" in ssh_debug:
+                forward_confirmed = True
+                break
+        except Exception:
+            pass
+    if ssh_proc.poll() is None and forward_confirmed:
+        tunnel_mode = "reverse_ssh"
+        tunnel_url = f"http://127.0.0.1:{REVERSE_SSH_REMOTE_PORT}"
+        print(f"[TUNNEL ESTABLISHED] URL: {tunnel_url} protocol=reverse-ssh")
+        print(f"=== TUNNEL_URL: {tunnel_url} ===")
+        notify_tunnel(tunnel_url)
+        return True
+    try: ssh_log.flush()
+    except Exception: pass
+    tail = Path(ssh_log_path).read_text(errors="replace")[-5000:]
+    print(f"[TUNNEL ATTEMPT FAILED] reverse-ssh exit={ssh_proc.poll()} tail={tail}")
+    tunnel_url = ""
+    return False
+
+
+def cloudflare_tail(limit=5000):
+    try:
+        return Path(cf_log_path).read_text(errors="replace")[-limit:]
+    except Exception as exc:
+        return f"unable to read cloudflared.log: {exc}"
+
+
 def spawn_cloudflare():
-    global cf_proc, cf_log, tunnel_url
+    global cf_proc, cf_log, tunnel_url, cf_protocol_index
+    if not os.path.exists(cf_bin):
+        print("[TUNNEL] Downloading Cloudflare tunnel binary for fallback...")
+        subprocess.run(["curl", "-sL", "-o", cf_bin, "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"], check=True)
+        os.chmod(cf_bin, 0o755)
     if cf_proc is not None and cf_proc.poll() is None:
         cf_proc.terminate()
         try: cf_proc.wait(timeout=5)
@@ -257,13 +458,17 @@ def spawn_cloudflare():
         if cf_log: cf_log.close()
     except Exception:
         pass
+    tunnel_url = ""
+    protocol = cf_protocols[cf_protocol_index % len(cf_protocols)]
+    cf_protocol_index += 1
     Path(cf_log_path).write_text("")
     cf_log = open(cf_log_path, "a")
-    cf_proc = subprocess.Popen([
-        cf_bin, "tunnel", "--url", f"http://127.0.0.1:{tunnel_target_port}",
-        "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4",
-    ],
-                               stdout=cf_log, stderr=subprocess.STDOUT)
+    command = [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{tunnel_target_port}",
+               "--no-autoupdate", "--edge-ip-version", "4"]
+    if protocol != "auto":
+        command.extend(["--protocol", protocol])
+    print(f"[TUNNEL] Starting cloudflared protocol={protocol}.")
+    cf_proc = subprocess.Popen(command, stdout=cf_log, stderr=subprocess.STDOUT)
     discovered = ""
     deadline = time.time() + 90
     while time.time() < deadline and cf_proc.poll() is None:
@@ -274,12 +479,35 @@ def spawn_cloudflare():
             discovered = match.group(0)
             break
     if discovered:
-        tunnel_url = discovered
-        print(f"[TUNNEL ESTABLISHED] URL: {tunnel_url}")
-        print(f"=== TUNNEL_URL: {tunnel_url} ===")
-        notify_tunnel(tunnel_url)
-        return True
-    print("[TUNNEL] cloudflared did not produce a URL; supervisor will retry.")
+        # A printed Quick Tunnel hostname is not proof that a connector reached the edge.
+        # Wait for an external /health HTTP 200 before publishing it to the controller.
+        health_deadline = time.time() + 45
+        last_health_error = ""
+        while time.time() < health_deadline and cf_proc.poll() is None:
+            try:
+                with urllib.request.urlopen(discovered + "/health", timeout=6) as response:
+                    if response.status == 200:
+                        tunnel_url = discovered
+                        print(f"[TUNNEL ESTABLISHED] URL: {tunnel_url} protocol={protocol}")
+                        print(f"=== TUNNEL_URL: {tunnel_url} ===")
+                        notify_tunnel(tunnel_url)
+                        return True
+                    last_health_error = f"HTTP {response.status}"
+            except Exception as exc:
+                last_health_error = str(exc)
+            time.sleep(3)
+        print(f"[TUNNEL ATTEMPT FAILED] protocol={protocol} url={discovered} health={last_health_error}")
+    else:
+        print(f"[TUNNEL ATTEMPT FAILED] protocol={protocol} cloudflared produced no URL exit={cf_proc.poll()}")
+    print(cloudflare_tail())
+    try:
+        if cf_proc.poll() is None:
+            cf_proc.terminate()
+            cf_proc.wait(timeout=5)
+    except Exception:
+        try: cf_proc.kill()
+        except Exception: pass
+    tunnel_url = ""
     return False
 
 
@@ -320,13 +548,27 @@ def restart_llama_server():
         if server_proc.poll() is not None:
             break
         time.sleep(2)
-    print("[SUPERVISOR] llama-server restart has not become healthy yet; will retry.")
-    return False
+    tail = tail_server_log()
+    print("[SUPERVISOR] llama-server restart failed. Tail log:")
+    print(tail)
+    print("PHASE failed " + json.dumps({"step": "llama-server-restart", "cause": "self-healing restart failed", "tail": tail[-5000:]}))
+    raise SystemExit(1)
 
 
-if not spawn_cloudflare():
-    time.sleep(5)
-    spawn_cloudflare()
+tunnel_started = spawn_outbound_relay() if RELAY_URL else False
+if not tunnel_started:
+    tunnel_started = spawn_reverse_ssh() if REVERSE_SSH_HOST else False
+if not tunnel_started:
+    for tunnel_attempt in range(len(cf_protocols)):
+        if spawn_cloudflare():
+            tunnel_started = True
+            break
+        if tunnel_attempt + 1 < len(cf_protocols):
+            time.sleep(5)
+if not tunnel_started:
+    failure = {"step": "tunnel", "cause": "all private and Quick Tunnel profiles failed", "tail": cloudflare_tail()}
+    print("PHASE failed " + json.dumps(failure))
+    sys.exit(1)
 
 print("[STEP 6] Tunnel registered; entering 10-second self-healing supervisor.")
 print(f"[LIFECYCLE] IDLE_TIMEOUT_MIN={IDLE_TIMEOUT_MIN} | MAX_RUNTIME_MIN={MAX_RUNTIME_MIN}")
@@ -357,7 +599,7 @@ def post_shutdown_status(reason, detail):
 def graceful_shutdown(reason, detail):
     print(f"[AUTO-SHUTDOWN] {reason}: {detail}")
     post_shutdown_status(reason, detail)
-    for proc in (server_proc, cf_proc, bridge_proc):
+    for proc in (server_proc, cf_proc, ssh_proc, bridge_proc):
         try:
             if proc and proc.poll() is None: proc.terminate()
         except Exception: pass
@@ -388,11 +630,23 @@ while True:
         restart_llama_server()
         local_failures = 0
 
-    tunnel_ok = cf_proc is not None and cf_proc.poll() is None and public_tunnel_healthy()
+    if tunnel_mode == "relay":
+        tunnel_ok = relay_thread is not None and relay_thread.is_alive()
+    elif tunnel_mode == "reverse_ssh":
+        tunnel_ok = ssh_proc is not None and ssh_proc.poll() is None
+    else:
+        tunnel_ok = cf_proc is not None and cf_proc.poll() is None and public_tunnel_healthy()
     tunnel_failures = 0 if tunnel_ok else tunnel_failures + 1
     if tunnel_failures >= 2:
-        print("[SUPERVISOR] Cloudflare tunnel unhealthy twice; rotating tunnel.")
-        spawn_cloudflare()
+        if tunnel_mode == "relay":
+            print("[SUPERVISOR] Outbound relay unhealthy twice; reconnecting.")
+            spawn_outbound_relay()
+        elif tunnel_mode == "reverse_ssh":
+            print("[SUPERVISOR] Reverse SSH transport unhealthy twice; reconnecting.")
+            spawn_reverse_ssh()
+        else:
+            print("[SUPERVISOR] Cloudflare tunnel unhealthy twice; rotating tunnel.")
+            spawn_cloudflare()
         tunnel_failures = 0
 
     if bridge_ready and bridge_proc.poll() is not None:

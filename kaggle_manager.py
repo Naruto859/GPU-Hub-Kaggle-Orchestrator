@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import socket
 import subprocess
 import tarfile
 import threading
@@ -33,6 +35,13 @@ MAX_RUNTIME_MIN_DEFAULT = 540.0
 PREWARM_LEAD_SECONDS = 15 * 60
 MAX_BOOT_SECONDS = 15 * 60
 BOOT_BASELINE_SECONDS = {"gpu": 270.0, "tpu": 570.0}
+CANONICAL_GPU_SLUG = "uncensored-llm-runner"
+CANONICAL_GPU_TITLE = "Uncensored LLM Runner"
+MANAGED_GPU_SLUG_PREFIXES = ("gpu-hub-", f"{CANONICAL_GPU_SLUG}-")
+MANAGED_GPU_SLUGS = {
+    CANONICAL_GPU_SLUG, "gpu-hub-dual-t4-runner", "gpu-engine",
+    "hermes-uncensored-engine", "kaggle-gpu-engine",
+}
 
 BRIDGE_SCRIPT_CODE = '''import asyncio, sys, time
 from fastapi import FastAPI, Request
@@ -121,6 +130,79 @@ if __name__ == "__main__":
 '''
 BRIDGE_CODE_B64 = base64.b64encode(BRIDGE_SCRIPT_CODE.encode("utf-8")).decode("utf-8")
 
+
+RELAY_KERNEL_CODE = r'''
+relay_thread = None
+
+def relay_post(path, payload, timeout=30):
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        RELAY_URL + path, data=data, method="POST",
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + RELAY_TOKEN},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status, response.read()
+
+def relay_worker():
+    global tunnel_url
+    while True:
+        try:
+            status, raw = relay_post("/poll", {"session_id": GPU_HUB_SESSION_ID, "timeout": 20}, timeout=30)
+            if status == 204 or not raw:
+                continue
+            job = json.loads(raw.decode("utf-8"))
+            job_id = str(job.get("id") or "")
+            path = str(job.get("path") or "/v1/chat/completions")
+            body = json.dumps(job.get("body") or {}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            for key, value in (job.get("headers") or {}).items():
+                if str(key).lower() in {"authorization", "x-api-key"}:
+                    headers[str(key)] = str(value)
+            local_request = urllib.request.Request(
+                "http://127.0.0.1:8081" + path, data=body, method="POST", headers=headers,
+            )
+            response_headers = {}
+            try:
+                with urllib.request.urlopen(local_request, timeout=610) as local_response:
+                    status_code = local_response.status
+                    response_body = local_response.read()
+                    response_headers["content-type"] = local_response.headers.get("content-type", "application/json")
+            except urllib.error.HTTPError as exc:
+                status_code = exc.code
+                response_body = exc.read()
+                response_headers["content-type"] = exc.headers.get("content-type", "application/json")
+            relay_post("/result", {
+                "session_id": GPU_HUB_SESSION_ID, "job_id": job_id,
+                "status_code": status_code, "headers": response_headers,
+                "body_b64": base64.b64encode(response_body).decode("ascii"),
+            }, timeout=30)
+        except Exception as exc:
+            print(f"[RELAY] Poll/request error: {exc}")
+            time.sleep(2)
+
+def spawn_outbound_relay():
+    global relay_thread, tunnel_url, tunnel_mode
+    if not RELAY_URL or not RELAY_TOKEN or not GPU_HUB_SESSION_ID:
+        return False
+    try:
+        status, _ = relay_post("/register", {
+            "session_id": GPU_HUB_SESSION_ID, "model_id": MODEL_ID,
+            "session_role": GPU_HUB_SESSION_ROLE,
+        }, timeout=15)
+        if status != 200:
+            return False
+    except Exception as exc:
+        print(f"[RELAY] Registration failed: {exc}")
+        return False
+    tunnel_mode = "relay"
+    tunnel_url = f"relay://{GPU_HUB_SESSION_ID}"
+    relay_thread = threading.Thread(target=relay_worker, daemon=True, name="gpu-hub-relay")
+    relay_thread.start()
+    print(f"[RELAY READY] session={GPU_HUB_SESSION_ID} endpoint={RELAY_URL}")
+    print(f"=== TUNNEL_URL: {tunnel_url} ===")
+    return True
+'''
+
 logger = logging.getLogger("kaggle_manager")
 
 KAGGLE_VENV_BIN = Path(os.environ.get("GPU_HUB_KAGGLE_BIN", "/root/kaggle-gpu/venv/bin/kaggle"))
@@ -194,6 +276,12 @@ class KernelSession:
     health_failures: int = 0
     unhealthy_since: float = 0.0
     tpu_recreate_attempts: int = 0
+    provisioning_started_at: Optional[float] = None
+    last_kaggle_state: str = ""
+    reverse_ssh_port: int = 0
+    reverse_ssh_key_path: Optional[Path] = field(default=None, repr=False)
+    reverse_ssh_auth_tag: str = ""
+    relay_token: str = field(default="", repr=False)
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     monitor_thread: Optional[threading.Thread] = field(default=None, repr=False)
 
@@ -222,6 +310,8 @@ class KernelSession:
             "kaggle_poll_frozen": self.kaggle_poll_frozen,
             "unhealthy_since": self.unhealthy_since or None,
             "tpu_recreate_attempts": self.tpu_recreate_attempts,
+            "provisioning_started_at": self.provisioning_started_at,
+            "queue_seconds": max(0.0, (self.provisioning_started_at or now) - self.launch_time),
         }
 
 
@@ -416,11 +506,13 @@ class KaggleKernelManager:
         self.status = "idle"  # idle, initializing, downloading, loading_vram, tunnel_active, ready, error
         self.status_detail = "System initialized and waiting for launch."
         self.launch_time: Optional[float] = None
-        self.kernel_slug = "gpu-hub/gpu-engine"
-        self.kernel_title = "GPU Engine"
+        self.kernel_slug = f"gpu-hub/{CANONICAL_GPU_SLUG}"
+        self.kernel_title = CANONICAL_GPU_TITLE
         self.tunnel_type = "cloudflare"  # cloudflare, ngrok
         self.ngrok_token = ""
         self.webhook_host = os.environ.get("GPU_HUB_WEBHOOK_HOST", "http://127.0.0.1:8778").rstrip("/")
+        self.relay_url = os.environ.get("GPU_HUB_RELAY_URL", "").strip().rstrip("/")
+        self.relay_hub = None
         self.recent_logs = []
         self._polling_thread = None
         self._stop_polling = threading.Event()
@@ -455,6 +547,11 @@ class KaggleKernelManager:
         self.circuit_backoff_seconds = 60
         self._single_key_rollover_thread: Optional[threading.Thread] = None
         self._proxy_transition_lock = threading.RLock()
+        self._ssh_auth_lock = threading.RLock()
+        self.reverse_ssh_host = os.environ.get("GPU_HUB_REVERSE_SSH_HOST", "").strip()
+        self.reverse_ssh_user = os.environ.get("GPU_HUB_REVERSE_SSH_USER", "root").strip() or "root"
+        self.reverse_ssh_server_port = int(os.environ.get("GPU_HUB_REVERSE_SSH_PORT", "22") or 22)
+        self.reverse_ssh_authorized_keys = Path(os.environ.get("GPU_HUB_REVERSE_SSH_AUTHORIZED_KEYS", "/root/.ssh/authorized_keys"))
         self._upstream_active_counts: Dict[str, int] = {}
         self._lifecycle_stop = threading.Event()
         self._lifecycle_thread = threading.Thread(target=self._lifecycle_loop, daemon=True, name="gpu-hub-lifecycle")
@@ -696,7 +793,7 @@ class KaggleKernelManager:
         if not hasattr(self, "kernel_title") or not self.kernel_title:
             self.kernel_title = "GPU Engine"
         if username and (not hasattr(self, "kernel_slug") or not self.kernel_slug or not self.kernel_slug.startswith(f"{username}/")):
-            self.kernel_slug = f"{username}/gpu-engine"
+            self.kernel_slug = f"{username}/{CANONICAL_GPU_SLUG}"
 
         return {
             "username": username,
@@ -1054,9 +1151,9 @@ class KaggleKernelManager:
     ) -> Tuple[str, str, str]:
         """
         Dynamically resolves (owner, slug, title) for the target Kaggle kernel.
-        TPU workflows keep their dedicated recipe slugs. GPU models use a stable
-        model-specific slug so pushing one model can never cancel or overwrite a
-        different model that previously used the legacy ``gpu-engine`` notebook.
+        TPU workflows keep their dedicated recipe slugs. Every Dual T4 model uses
+        one canonical GPU runner slug so a model switch replaces the previous run
+        instead of leaving multiple queued/running Kaggle GPU sessions behind.
         """
         account = self.account_pool.get(account_id) if account_id else self.account_pool.active()
         username = str((account or {}).get("username") or "")
@@ -1070,8 +1167,8 @@ class KaggleKernelManager:
         is_tpu = model.get("accelerator") == "tpu"
         workflow = model.get("kernel_workflow")
         resolved_model_id = normalize_model_id(model_id or self.active_model_id)
-        gpu_model_slug = f"gpu-hub-{re.sub(r'[^a-z0-9]+', '-', resolved_model_id.lower()).strip('-')}"[:48].rstrip("-")
-        gpu_model_title = f"GPU Hub {resolved_model_id}"[:50]
+        gpu_model_slug = CANONICAL_GPU_SLUG
+        gpu_model_title = CANONICAL_GPU_TITLE
 
         # If existing kernels were found, verify owner
         if existing_kernels:
@@ -1083,8 +1180,7 @@ class KaggleKernelManager:
         preferred_slugs = (
             ["qwen38-tpu-serve", "gpu-hub-qwen38"] if workflow == "qwen38_tpu"
             else ["glm53-tpu-serve", "gpu-hub-glm53"] if workflow == "glm53_tpu"
-            else [gpu_model_slug, "gpu-engine", "hermes-uncensored-engine", "kaggle-gpu-engine"]
-            if resolved_model_id == DEFAULT_MODEL_ID else [gpu_model_slug]
+            else [CANONICAL_GPU_SLUG, "gpu-engine", "hermes-uncensored-engine", "kaggle-gpu-engine"]
         )
         for target_slug in preferred_slugs:
             for k in existing_kernels:
@@ -1101,7 +1197,7 @@ class KaggleKernelManager:
         target_title_phrases = (
             ["qwen38", "qwen3.8"] if workflow == "qwen38_tpu"
             else ["glm53", "glm-5.3"] if workflow == "glm53_tpu"
-            else ["gpu engine", "uncensored engine"] if resolved_model_id == DEFAULT_MODEL_ID else []
+            else ["gpu hub dual t4 runner", "gpu engine", "uncensored engine"]
         )
         for phrase in target_title_phrases:
             for k in existing_kernels:
@@ -1130,8 +1226,8 @@ class KaggleKernelManager:
                 ("gpu-hub-glm53", "GPU Hub GLM53"),
                 ("glm53-flash-api", "GLM53 Flash API"),
             ] if is_tpu else [
-                (f"{gpu_model_slug}-v2"[:48].rstrip("-"), f"{gpu_model_title} v2"[:80]),
-                (f"{gpu_model_slug}-v3"[:48].rstrip("-"), f"{gpu_model_title} v3"[:80]),
+                (f"{CANONICAL_GPU_SLUG}-v2", f"{CANONICAL_GPU_TITLE} v2"),
+                (f"{CANONICAL_GPU_SLUG}-v3", f"{CANONICAL_GPU_TITLE} v3"),
             ])
             for alt_slug, alt_title in alternatives:
                 if alt_slug.lower() not in taken_slugs and alt_title.lower() not in taken_titles:
@@ -1140,13 +1236,45 @@ class KaggleKernelManager:
                     break
             else:
                 rand_id = int(time.time()) % 10000
-                default_slug = f"gpu-engine-{rand_id}"
-                default_title = f"GPU Engine {rand_id}"
+                default_slug = f"{CANONICAL_GPU_SLUG}-{rand_id}"
+                default_title = f"{CANONICAL_GPU_TITLE} {rand_id}"
 
         self.kernel_slug = f"{username}/{default_slug}"
         self.kernel_title = default_title
         self.log(f"Resolved new kernel identity: {self.kernel_slug} ('{self.kernel_title}')")
         return username, default_slug, default_title
+
+    @staticmethod
+    def _is_managed_gpu_slug(slug: str) -> bool:
+        normalized = str(slug or "").strip().lower()
+        return normalized in MANAGED_GPU_SLUGS or any(normalized.startswith(prefix) for prefix in MANAGED_GPU_SLUG_PREFIXES)
+
+    def _delete_managed_gpu_kernels(self, account_id: str) -> List[str]:
+        """Delete stale GPU Hub notebooks before a new GPU push to prevent Kaggle slot collisions."""
+        deleted: List[str] = []
+        for kernel in self.fetch_existing_kernels(force=True, account_id=account_id):
+            slug = str(kernel.get("slug") or "").strip()
+            ref = str(kernel.get("ref") or "").strip()
+            if not ref and slug:
+                owner = str(kernel.get("owner") or (self.get_current_account(account_id) or {}).get("username") or "").strip()
+                ref = f"{owner}/{slug}" if owner else ""
+            managed_slug = slug or ref.rsplit("/", 1)[-1]
+            if not ref or not self._is_managed_gpu_slug(managed_slug):
+                continue
+            if managed_slug.strip().lower() == CANONICAL_GPU_SLUG:
+                self.log(f"[GPU SLOT CLEANUP] Preserving canonical notebook {ref}; the next push creates a new version without a delayed delete cancellation.")
+                continue
+            result = self._run_kaggle(account_id, ["kernels", "delete", ref, "-y"], timeout=60)
+            output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
+            if result.returncode != 0 and not any(term in output.lower() for term in ("not found", "permission 'kernels.get' was denied", "wrong kernel slug")):
+                raise RuntimeError(f"Could not clear stale managed GPU kernel {ref}: {kaggle_error_line(output)}")
+            deleted.append(ref)
+            self.log(f"[GPU SLOT CLEANUP] Removed stale managed kernel {ref} before launch.")
+        self._cached_kernels = None
+        self._cached_kernels_time = 0.0
+        if deleted:
+            time.sleep(5)
+        return deleted
 
     def log(self, message: str):
         timestamp = time.strftime("%H:%M:%S")
@@ -1256,7 +1384,82 @@ class KaggleKernelManager:
             raise RuntimeError("Qwen TPU launcher config marker was not found")
         return source
 
-    def generate_kernel_script(self, model_id: str, session_id: str = "", session_role: str = "active", accelerator: Optional[str] = None) -> str:
+    def _prepare_reverse_ssh_access(self, session: KernelSession) -> Dict[str, Any]:
+        """Create a per-session, loopback-only reverse-forward credential.
+
+        Kaggle has begun externally cancelling workers shortly after Quick Tunnel
+        startup on some accounts. A restricted SSH reverse forward keeps the
+        upstream private on this controller and leaves the permanent Tailscale
+        client endpoint unchanged.
+        """
+        if not self.reverse_ssh_host or session.accelerator != "gpu":
+            return {}
+        key_dir = RUNTIME_BUNDLE_DIR / "ssh-keys"
+        key_dir.mkdir(parents=True, exist_ok=True)
+        key_path = key_dir / f"{session.id}.ed25519"
+        for candidate in (key_path, key_path.with_suffix(key_path.suffix + ".pub")):
+            if candidate.exists():
+                candidate.unlink()
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            remote_port = int(listener.getsockname()[1])
+        public_parts = key_path.with_suffix(key_path.suffix + ".pub").read_text(encoding="utf-8").strip().split()
+        if len(public_parts) < 2:
+            raise RuntimeError("ssh-keygen did not produce a usable public key")
+        tag = f"gpuhub-{session.id}"
+        options = (
+            "no-pty,no-agent-forwarding,no-X11-forwarding,"
+            'permitopen="127.0.0.1:1",'
+            f'permitlisten="127.0.0.1:{remote_port}"'
+        )
+        line = f"{options} {public_parts[0]} {public_parts[1]} {tag}"
+        auth_path = self.reverse_ssh_authorized_keys
+        with self._ssh_auth_lock:
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(auth_path.parent, 0o700)
+            existing = auth_path.read_text(encoding="utf-8") if auth_path.exists() else ""
+            kept = [entry for entry in existing.splitlines() if tag not in entry]
+            kept.append(line)
+            auth_path.write_text("\n".join(entry for entry in kept if entry).rstrip() + "\n", encoding="utf-8")
+            os.chmod(auth_path, 0o600)
+        session.reverse_ssh_port = remote_port
+        session.reverse_ssh_key_path = key_path
+        session.reverse_ssh_auth_tag = tag
+        return {
+            "host": self.reverse_ssh_host,
+            "user": self.reverse_ssh_user,
+            "server_port": self.reverse_ssh_server_port,
+            "remote_port": remote_port,
+            "private_key_b64": base64.b64encode(key_path.read_bytes()).decode("ascii"),
+        }
+
+    def _cleanup_reverse_ssh_access(self, session: KernelSession) -> None:
+        tag = str(session.reverse_ssh_auth_tag or "").strip()
+        if tag:
+            with self._ssh_auth_lock:
+                auth_path = self.reverse_ssh_authorized_keys
+                if auth_path.exists():
+                    lines = [line for line in auth_path.read_text(encoding="utf-8").splitlines() if tag not in line]
+                    auth_path.write_text("\n".join(lines).rstrip() + ("\n" if lines else ""), encoding="utf-8")
+                    os.chmod(auth_path, 0o600)
+        key_path = session.reverse_ssh_key_path
+        if key_path:
+            for candidate in (key_path, key_path.with_suffix(key_path.suffix + ".pub")):
+                try:
+                    candidate.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        session.reverse_ssh_auth_tag = ""
+        session.reverse_ssh_key_path = None
+
+    def generate_kernel_script(self, model_id: str, session_id: str = "", session_role: str = "active", accelerator: Optional[str] = None, reverse_tunnel: Optional[Dict[str, Any]] = None) -> str:
         model = self.model_spec(model_id, accelerator)
         if model.get("kernel_workflow") == "qwen38_tpu":
             return self.generate_qwen_tpu_kernel_script(model_id, session_id=session_id, session_role=session_role)
@@ -1275,6 +1478,12 @@ class KaggleKernelManager:
         webhook_target = f"{self.webhook_host}/api/tunnel/register"
         idle_timeout_min = float(getattr(self, "idle_timeout_min", IDLE_TIMEOUT_MIN_DEFAULT))
         max_runtime_min = float(getattr(self, "max_runtime_min", MAX_RUNTIME_MIN_DEFAULT))
+        reverse_tunnel = reverse_tunnel or {}
+        relay_url = self.relay_url if session_id else ""
+        relay_token = ""
+        if session_id:
+            relay_session = self.sessions.get(session_id)
+            relay_token = str(relay_session.relay_token if relay_session else "")
 
         ctx_disp = model.get("context_display", f"{model.get('context_length', 32768)} tokens")
         rope_disp = model.get("rope_scaling", "Native / None")
@@ -1295,7 +1504,10 @@ import subprocess
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 import re
+import base64
+import threading
 from pathlib import Path
 
 print("=" * 70)
@@ -1310,6 +1522,13 @@ MODEL_ID = {json.dumps(model_key)}
 WEBHOOK_TARGET = {json.dumps(webhook_target)}
 GPU_HUB_SESSION_ID = {json.dumps(session_id)}
 GPU_HUB_SESSION_ROLE = {json.dumps(session_role)}
+REVERSE_SSH_HOST = {json.dumps(str(reverse_tunnel.get("host") or ""))}
+REVERSE_SSH_USER = {json.dumps(str(reverse_tunnel.get("user") or "root"))}
+REVERSE_SSH_SERVER_PORT = {int(reverse_tunnel.get("server_port") or 22)}
+REVERSE_SSH_REMOTE_PORT = {int(reverse_tunnel.get("remote_port") or 0)}
+REVERSE_SSH_PRIVATE_KEY_B64 = {json.dumps(str(reverse_tunnel.get("private_key_b64") or ""))}
+RELAY_URL = {json.dumps(relay_url)}
+RELAY_TOKEN = {json.dumps(relay_token)}
 
 # --- Auto-shutdown lifecycle timers (minutes) ----------------------------------
 # Injected at bundle-prep time from the dashboard settings (config.json), so
@@ -1444,37 +1663,89 @@ else:
 
 # Step 4: Launch llama-server with Dual-GPU offload
 print("\\n[STEP 4] Launching llama-server in background with GPU offloading...")
-server_cmd = [
+base_server_cmd = [
     LLAMA_SERVER,
     "-m", model_path,
     ''' + server_args_str + '''
 ]
 
-print("[SERVER CMD]:", " ".join(server_cmd))
-server_log = open("/tmp/llama_server.log", "w")
-server_proc = subprocess.Popen(server_cmd, stdout=server_log, stderr=subprocess.STDOUT)
-print(f"[SERVER] Process spawned with PID: {server_proc.pid}")
 
-# Poll health endpoint
-print("[SERVER] Waiting for model to load into VRAM...")
-ready = False
-for attempt in range(120):
-    time.sleep(3)
+def tail_server_log(limit=5000):
     try:
-        req = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2)
-        if req.status == 200:
-            print(f"\\n[SERVER READY] Model is fully loaded and accepting requests on port 8080! (attempt {attempt+1})")
-            ready = True
+        return Path("/tmp/llama_server.log").read_text(errors="replace")[-limit:]
+    except Exception as exc:
+        return f"unable to read llama_server.log: {exc}"
+
+
+def set_arg(command, flag, value):
+    updated = list(command)
+    if flag in updated:
+        updated[updated.index(flag) + 1] = str(value)
+    return updated
+
+
+# Primary profile preserves fast attention and two slots. If this particular GGUF
+# rejects a flag or exits during CUDA initialization, retry once with a smaller,
+# compatibility-focused profile instead of letting cloudflared expose a dead origin.
+compat_server_cmd = list(base_server_cmd)
+if "-fa" in compat_server_cmd:
+    index = compat_server_cmd.index("-fa")
+    del compat_server_cmd[index:index + 2]
+compat_server_cmd = set_arg(compat_server_cmd, "--parallel", 1)
+compat_server_cmd = set_arg(compat_server_cmd, "-c", 16384)
+compat_server_cmd = set_arg(compat_server_cmd, "-b", 512)
+compat_server_cmd = set_arg(compat_server_cmd, "-ub", 256)
+server_profiles = [("dual-t4-safe", base_server_cmd), ("compatibility", compat_server_cmd)]
+server_proc = None
+server_log = None
+server_cmd = base_server_cmd
+ready = False
+last_server_tail = ""
+
+for profile_index, (profile_name, candidate_cmd) in enumerate(server_profiles, start=1):
+    server_cmd = candidate_cmd
+    print(f"[SERVER PROFILE {profile_index}/{len(server_profiles)}] {profile_name}")
+    print("[SERVER CMD]:", " ".join(server_cmd))
+    if server_log:
+        try: server_log.close()
+        except Exception: pass
+    server_log = open("/tmp/llama_server.log", "w")
+    server_proc = subprocess.Popen(server_cmd, stdout=server_log, stderr=subprocess.STDOUT)
+    print(f"[SERVER] Process spawned with PID: {server_proc.pid}")
+    print("[SERVER] Waiting for model to load into VRAM...")
+    for attempt in range(180):
+        time.sleep(2)
+        if server_proc.poll() is not None:
             break
+        try:
+            req = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=2)
+            if req.status == 200:
+                print(f"\\n[SERVER READY] Model is fully loaded and accepting requests on port 8080! (attempt {attempt+1}, profile={profile_name})")
+                ready = True
+                break
+        except Exception:
+            if attempt % 5 == 0:
+                sys.stdout.write(".")
+                sys.stdout.flush()
+    if ready:
+        break
+    try: server_log.flush()
+    except Exception: pass
+    last_server_tail = tail_server_log()
+    exit_code = server_proc.poll()
+    print(f"\\n[SERVER ATTEMPT FAILED] profile={profile_name} exit_code={exit_code}")
+    print(last_server_tail)
+    try:
+        if server_proc.poll() is None:
+            server_proc.terminate()
+            server_proc.wait(timeout=10)
     except Exception:
-        sys.stdout.write(".")
-        sys.stdout.flush()
+        try: server_proc.kill()
+        except Exception: pass
 
 if not ready:
-    print("\\n[ERROR] Server failed to become ready within timeout. Tail log:")
-    server_log.flush()
-    with open("/tmp/llama_server.log") as f:
-        print(f.read()[-3000:])
+    failure = {"step": "llama-server", "cause": "all startup profiles failed", "tail": last_server_tail[-5000:]}
+    print("PHASE failed " + json.dumps(failure))
     sys.exit(1)
 
 # Step 4b: Launch Early-Ping Keepalive Bridge on port 8081
@@ -1506,15 +1777,15 @@ if not bridge_ready:
 # Step 5: Start Tunnel and self-healing supervisor
 print(f"\\n[STEP 5] Setting up secure outbound tunnel to port {tunnel_target_port}...")
 cf_bin = "/tmp/bin/cloudflared"
-if not os.path.exists(cf_bin):
-    print("[TUNNEL] Downloading Cloudflare tunnel binary...")
-    subprocess.run(["curl", "-sL", "-o", cf_bin, "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"], check=True)
-    os.chmod(cf_bin, 0o755)
-
 cf_log_path = "/tmp/cloudflared.log"
 cf_proc = None
 cf_log = None
 tunnel_url = ""
+cf_protocols = ("auto", "http2", "quic")
+cf_protocol_index = 0
+ssh_proc = None
+ssh_log = None
+tunnel_mode = "cloudflare"
 
 
 def notify_tunnel(url, status="ready"):
@@ -1529,8 +1800,77 @@ def notify_tunnel(url, status="ready"):
         print(f"[WEBHOOK] Registration failed for {url}: {exc}")
 
 
+''' + RELAY_KERNEL_CODE + '''
+
+
+def spawn_reverse_ssh():
+    global ssh_proc, ssh_log, tunnel_url, tunnel_mode
+    if not REVERSE_SSH_HOST or not REVERSE_SSH_REMOTE_PORT or not REVERSE_SSH_PRIVATE_KEY_B64:
+        return False
+    try:
+        if ssh_proc is not None and ssh_proc.poll() is None:
+            ssh_proc.terminate()
+            try: ssh_proc.wait(timeout=5)
+            except Exception: ssh_proc.kill()
+    except Exception:
+        pass
+    key_path = "/tmp/gpu_hub_reverse_ssh_key"
+    Path(key_path).write_bytes(base64.b64decode(REVERSE_SSH_PRIVATE_KEY_B64))
+    os.chmod(key_path, 0o600)
+    ssh_log_path = "/tmp/reverse_ssh.log"
+    Path(ssh_log_path).write_text("")
+    ssh_log = open(ssh_log_path, "a")
+    command = [
+        "ssh", "-v", "-i", key_path, "-N", "-T", "-p", str(REVERSE_SSH_SERVER_PORT),
+        "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null", "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+        "-R", f"127.0.0.1:{REVERSE_SSH_REMOTE_PORT}:127.0.0.1:{tunnel_target_port}",
+        f"{REVERSE_SSH_USER}@{REVERSE_SSH_HOST}",
+    ]
+    print(f"[TUNNEL] Starting restricted reverse SSH transport to {REVERSE_SSH_HOST}:{REVERSE_SSH_SERVER_PORT}.")
+    ssh_proc = subprocess.Popen(command, stdout=ssh_log, stderr=subprocess.STDOUT)
+    forward_confirmed = False
+    for _ in range(30):
+        time.sleep(0.5)
+        if ssh_proc.poll() is not None:
+            break
+        try:
+            ssh_log.flush()
+            ssh_debug = Path(ssh_log_path).read_text(errors="replace")
+            if "remote forward success" in ssh_debug or "forwarding_success: all expected" in ssh_debug:
+                forward_confirmed = True
+                break
+        except Exception:
+            pass
+    if ssh_proc.poll() is None and forward_confirmed:
+        tunnel_mode = "reverse_ssh"
+        tunnel_url = f"http://127.0.0.1:{REVERSE_SSH_REMOTE_PORT}"
+        print(f"[TUNNEL ESTABLISHED] URL: {tunnel_url} protocol=reverse-ssh")
+        print(f"=== TUNNEL_URL: {tunnel_url} ===")
+        notify_tunnel(tunnel_url)
+        return True
+    try: ssh_log.flush()
+    except Exception: pass
+    tail = Path(ssh_log_path).read_text(errors="replace")[-5000:]
+    print(f"[TUNNEL ATTEMPT FAILED] reverse-ssh exit={ssh_proc.poll()} tail={tail}")
+    tunnel_url = ""
+    return False
+
+
+def cloudflare_tail(limit=5000):
+    try:
+        return Path(cf_log_path).read_text(errors="replace")[-limit:]
+    except Exception as exc:
+        return f"unable to read cloudflared.log: {exc}"
+
+
 def spawn_cloudflare():
-    global cf_proc, cf_log, tunnel_url
+    global cf_proc, cf_log, tunnel_url, cf_protocol_index
+    if not os.path.exists(cf_bin):
+        print("[TUNNEL] Downloading Cloudflare tunnel binary for fallback...")
+        subprocess.run(["curl", "-sL", "-o", cf_bin, "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"], check=True)
+        os.chmod(cf_bin, 0o755)
     if cf_proc is not None and cf_proc.poll() is None:
         cf_proc.terminate()
         try: cf_proc.wait(timeout=5)
@@ -1539,13 +1879,17 @@ def spawn_cloudflare():
         if cf_log: cf_log.close()
     except Exception:
         pass
+    tunnel_url = ""
+    protocol = cf_protocols[cf_protocol_index % len(cf_protocols)]
+    cf_protocol_index += 1
     Path(cf_log_path).write_text("")
     cf_log = open(cf_log_path, "a")
-    cf_proc = subprocess.Popen([
-        cf_bin, "tunnel", "--url", f"http://127.0.0.1:{tunnel_target_port}",
-        "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4",
-    ],
-                               stdout=cf_log, stderr=subprocess.STDOUT)
+    command = [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{tunnel_target_port}",
+               "--no-autoupdate", "--edge-ip-version", "4"]
+    if protocol != "auto":
+        command.extend(["--protocol", protocol])
+    print(f"[TUNNEL] Starting cloudflared protocol={protocol}.")
+    cf_proc = subprocess.Popen(command, stdout=cf_log, stderr=subprocess.STDOUT)
     discovered = ""
     deadline = time.time() + 90
     while time.time() < deadline and cf_proc.poll() is None:
@@ -1556,12 +1900,35 @@ def spawn_cloudflare():
             discovered = match.group(0)
             break
     if discovered:
-        tunnel_url = discovered
-        print(f"[TUNNEL ESTABLISHED] URL: {tunnel_url}")
-        print(f"=== TUNNEL_URL: {tunnel_url} ===")
-        notify_tunnel(tunnel_url)
-        return True
-    print("[TUNNEL] cloudflared did not produce a URL; supervisor will retry.")
+        # A printed Quick Tunnel hostname is not proof that a connector reached the edge.
+        # Wait for an external /health HTTP 200 before publishing it to the controller.
+        health_deadline = time.time() + 45
+        last_health_error = ""
+        while time.time() < health_deadline and cf_proc.poll() is None:
+            try:
+                with urllib.request.urlopen(discovered + "/health", timeout=6) as response:
+                    if response.status == 200:
+                        tunnel_url = discovered
+                        print(f"[TUNNEL ESTABLISHED] URL: {tunnel_url} protocol={protocol}")
+                        print(f"=== TUNNEL_URL: {tunnel_url} ===")
+                        notify_tunnel(tunnel_url)
+                        return True
+                    last_health_error = f"HTTP {response.status}"
+            except Exception as exc:
+                last_health_error = str(exc)
+            time.sleep(3)
+        print(f"[TUNNEL ATTEMPT FAILED] protocol={protocol} url={discovered} health={last_health_error}")
+    else:
+        print(f"[TUNNEL ATTEMPT FAILED] protocol={protocol} cloudflared produced no URL exit={cf_proc.poll()}")
+    print(cloudflare_tail())
+    try:
+        if cf_proc.poll() is None:
+            cf_proc.terminate()
+            cf_proc.wait(timeout=5)
+    except Exception:
+        try: cf_proc.kill()
+        except Exception: pass
+    tunnel_url = ""
     return False
 
 
@@ -1602,13 +1969,27 @@ def restart_llama_server():
         if server_proc.poll() is not None:
             break
         time.sleep(2)
-    print("[SUPERVISOR] llama-server restart has not become healthy yet; will retry.")
-    return False
+    tail = tail_server_log()
+    print("[SUPERVISOR] llama-server restart failed. Tail log:")
+    print(tail)
+    print("PHASE failed " + json.dumps({"step": "llama-server-restart", "cause": "self-healing restart failed", "tail": tail[-5000:]}))
+    raise SystemExit(1)
 
 
-if not spawn_cloudflare():
-    time.sleep(5)
-    spawn_cloudflare()
+tunnel_started = spawn_outbound_relay() if RELAY_URL else False
+if not tunnel_started:
+    tunnel_started = spawn_reverse_ssh() if REVERSE_SSH_HOST else False
+if not tunnel_started:
+    for tunnel_attempt in range(len(cf_protocols)):
+        if spawn_cloudflare():
+            tunnel_started = True
+            break
+        if tunnel_attempt + 1 < len(cf_protocols):
+            time.sleep(5)
+if not tunnel_started:
+    failure = {"step": "tunnel", "cause": "all private and Quick Tunnel profiles failed", "tail": cloudflare_tail()}
+    print("PHASE failed " + json.dumps(failure))
+    sys.exit(1)
 
 print("[STEP 6] Tunnel registered; entering 10-second self-healing supervisor.")
 print(f"[LIFECYCLE] IDLE_TIMEOUT_MIN={IDLE_TIMEOUT_MIN} | MAX_RUNTIME_MIN={MAX_RUNTIME_MIN}")
@@ -1639,7 +2020,7 @@ def post_shutdown_status(reason, detail):
 def graceful_shutdown(reason, detail):
     print(f"[AUTO-SHUTDOWN] {reason}: {detail}")
     post_shutdown_status(reason, detail)
-    for proc in (server_proc, cf_proc, bridge_proc):
+    for proc in (server_proc, cf_proc, ssh_proc, bridge_proc):
         try:
             if proc and proc.poll() is None: proc.terminate()
         except Exception: pass
@@ -1670,11 +2051,23 @@ while True:
         restart_llama_server()
         local_failures = 0
 
-    tunnel_ok = cf_proc is not None and cf_proc.poll() is None and public_tunnel_healthy()
+    if tunnel_mode == "relay":
+        tunnel_ok = relay_thread is not None and relay_thread.is_alive()
+    elif tunnel_mode == "reverse_ssh":
+        tunnel_ok = ssh_proc is not None and ssh_proc.poll() is None
+    else:
+        tunnel_ok = cf_proc is not None and cf_proc.poll() is None and public_tunnel_healthy()
     tunnel_failures = 0 if tunnel_ok else tunnel_failures + 1
     if tunnel_failures >= 2:
-        print("[SUPERVISOR] Cloudflare tunnel unhealthy twice; rotating tunnel.")
-        spawn_cloudflare()
+        if tunnel_mode == "relay":
+            print("[SUPERVISOR] Outbound relay unhealthy twice; reconnecting.")
+            spawn_outbound_relay()
+        elif tunnel_mode == "reverse_ssh":
+            print("[SUPERVISOR] Reverse SSH transport unhealthy twice; reconnecting.")
+            spawn_reverse_ssh()
+        else:
+            print("[SUPERVISOR] Cloudflare tunnel unhealthy twice; rotating tunnel.")
+            spawn_cloudflare()
         tunnel_failures = 0
 
     if bridge_ready and bridge_proc.poll() is not None:
@@ -2006,7 +2399,7 @@ while True:
                                 intentional_idle_shutdown = True
 
                             # Detect Cloudflare tunnel URL from either JSON logs or plain CLI output.
-                            match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+                            match = re.search(r"(?:https://[a-zA-Z0-9-]+\.trycloudflare\.com|http://127\.0\.0\.1:\d+)", line)
                             if match and not self.tunnel_url:
                                 found_url = match.group(0)
                                 self.log(f"[TUNNEL DETECTED] Cloudflare: {found_url}")
@@ -2192,7 +2585,7 @@ while True:
         workflow = model.get("kernel_workflow")
         session_id = str(account.get("session_id") or uuid.uuid4().hex[:12])
         launch_time = float(account.get("session_started_at") or self.launch_time or time.time())
-        slug = "qwen38-tpu-serve" if workflow == "qwen38_tpu" else "glm53-tpu-serve" if accelerator == "tpu" else "gpu-engine"
+        slug = "qwen38-tpu-serve" if workflow == "qwen38_tpu" else "glm53-tpu-serve" if accelerator == "tpu" else CANONICAL_GPU_SLUG
         session = KernelSession(
             id=session_id,
             role="active",
@@ -2201,7 +2594,7 @@ while True:
             accelerator=accelerator,
             launch_time=launch_time,
             kernel_slug=f"{account['username']}/{slug}",
-            kernel_title="Qwen38 TPU Serve" if workflow == "qwen38_tpu" else "GLM53 TPU Serve" if accelerator == "tpu" else "GPU Engine",
+            kernel_title="Qwen38 TPU Serve" if workflow == "qwen38_tpu" else "GLM53 TPU Serve" if accelerator == "tpu" else CANONICAL_GPU_TITLE,
             tunnel_url=self.tunnel_url.rstrip("/"),
             status="ready",
             ready_time=time.time(),
@@ -2244,8 +2637,20 @@ while True:
                 return False
             session.tunnel_url = url.rstrip("/")
             session.status = "health_check"
-            session.status_detail = "Tunnel discovered; waiting for /v1/models readiness check."
+            session.status_detail = "Upstream discovered; waiting for readiness check."
         self.log(f"[{session.role.upper()}] Tunnel discovered for {session.id}: {session.tunnel_url}")
+        return True
+
+    def register_session_relay(self, session_id: str) -> bool:
+        session = self._session_by_id(session_id)
+        if not session or session.stop_event.is_set():
+            return False
+        with self._state_lock:
+            session.tunnel_url = f"relay://{session.id}"
+            session.status = "health_check"
+            session.status_detail = "Kaggle outbound relay registered; verifying request channel."
+        self.log(f"[{session.role.upper()}] Outbound relay registered for {session.id}.")
+        self._session_ready(session)
         return True
 
     def handle_session_shutdown(self, session_id: Optional[str], reason: str, detail: str = "") -> None:
@@ -2267,7 +2672,12 @@ while True:
     def _prepare_session_bundle(self, session: KernelSession) -> Path:
         bundle_dir = RUNTIME_BUNDLE_DIR / session.id
         bundle_dir.mkdir(parents=True, exist_ok=True)
-        source = self.generate_kernel_script(session.model_id, session.id, session.role, session.accelerator)
+        if self.relay_url:
+            session.relay_token = secrets.token_urlsafe(32)
+            reverse_tunnel = {}
+        else:
+            reverse_tunnel = self._prepare_reverse_ssh_access(session)
+        source = self.generate_kernel_script(session.model_id, session.id, session.role, session.accelerator, reverse_tunnel=reverse_tunnel)
         (bundle_dir / "kernel.py").write_text(source, encoding="utf-8")
         owner, slug, title = self.resolve_kernel_identity(
             force=True,
@@ -2275,11 +2685,17 @@ while True:
             account_id=session.account_id,
             accelerator=session.accelerator,
         )
+        model = self.model_spec(session.model_id, session.accelerator)
+        is_tpu = model.get("accelerator") == "tpu"
+        if not is_tpu:
+            # Kaggle can carry CANCEL_ACKNOWLEDGED across versions of a reused
+            # notebook slug. Scope status/cancellation to this exact launch and
+            # remove older terminal GPU Hub slugs before the next launch.
+            slug = f"{CANONICAL_GPU_SLUG}-{session.id[:8]}"
+            title = f"{CANONICAL_GPU_TITLE} {session.id[:8]}"
         session.kernel_slug = f"{owner}/{slug}"
         session.kernel_title = title
         session.bundle_dir = bundle_dir
-        model = self.model_spec(session.model_id, session.accelerator)
-        is_tpu = model.get("accelerator") == "tpu"
         metadata = {
             "id": session.kernel_slug,
             "title": session.kernel_title,
@@ -2304,12 +2720,11 @@ while True:
         model = self.model_spec(session.model_id, session.accelerator)
         workflow = model.get("kernel_workflow")
         model_id = normalize_model_id(session.model_id)
-        gpu_model_slug = f"gpu-hub-{re.sub(r'[^a-z0-9]+', '-', model_id.lower()).strip('-')}"[:48].rstrip("-")
+        gpu_model_slug = CANONICAL_GPU_SLUG
         preferred = (
             ["qwen38-tpu-serve", "gpu-hub-qwen38"] if workflow == "qwen38_tpu"
             else ["glm53-tpu-serve", "gpu-hub-glm53"] if workflow == "glm53_tpu"
-            else [gpu_model_slug, "gpu-engine", "hermes-uncensored-engine", "kaggle-gpu-engine"]
-            if model_id == DEFAULT_MODEL_ID else [gpu_model_slug]
+            else [CANONICAL_GPU_SLUG]
         )
         explicit = re.search(r"\(?([a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+)\)?", output)
         candidate = None
@@ -2343,6 +2758,37 @@ while True:
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         self.log(f"[409 ADOPT] Retrying with existing kernel {session.kernel_slug} ({session.kernel_title}).")
         return True
+
+    def _adopt_actual_pushed_identity(self, session: KernelSession, output: str) -> None:
+        """Use the slug Kaggle actually created instead of assuming metadata was honored."""
+        match = re.search(r"kaggle\.com/code/([a-zA-Z0-9_-]+)/([a-zA-Z0-9_-]+)", str(output or ""))
+        ref = f"{match.group(1)}/{match.group(2)}" if match else ""
+        if not ref:
+            try:
+                candidates = self.fetch_existing_kernels(force=True, account_id=session.account_id)
+            except Exception:
+                candidates = []
+            title = str(session.kernel_title or "").strip().lower()
+            candidate = next(
+                (item for item in candidates if str(item.get("title") or "").strip().lower() == title),
+                None,
+            )
+            if not candidate:
+                candidate = next(
+                    (item for item in candidates if str(item.get("slug") or "").strip().lower() == CANONICAL_GPU_SLUG),
+                    None,
+                )
+            if candidate:
+                ref = str(candidate.get("ref") or "").strip()
+                if not ref:
+                    owner = str(candidate.get("owner") or "").strip()
+                    slug = str(candidate.get("slug") or "").strip()
+                    ref = f"{owner}/{slug}" if owner and slug else ""
+        if ref and ref != session.kernel_slug:
+            old_ref = session.kernel_slug
+            session.kernel_slug = ref
+            self.kernel_slug = ref
+            self.log(f"[KAGGLE IDENTITY] Kaggle created {ref}; controller updated from requested {old_ref}.")
 
     def _apply_tpu_dataset_fallback(self, session: KernelSession, output: str) -> bool:
         model = self.model_spec(session.model_id, session.accelerator)
@@ -2550,6 +2996,9 @@ while True:
         elif role == "test":
             self.account_pool.mark(account_id, "TESTING_BOOT")
         try:
+            if accelerator == "gpu":
+                session.status_detail = "Clearing stale GPU Hub kernels to free the Kaggle GPU slot."
+                self._delete_managed_gpu_kernels(account_id)
             bundle_dir = self._prepare_session_bundle(session)
         except Exception as exc:
             self._handle_session_failure(session, f"Bundle preparation failed: {exc}")
@@ -2600,9 +3049,10 @@ while True:
             exact_error = kaggle_error_line(output)
             self._handle_session_failure(session, f"Kaggle push rejected: {exact_error}")
             return {"success": False, "error": exact_error, "session_id": session.id}
+        self._adopt_actual_pushed_identity(session, output)
         session.status = "queued"
         session.status_detail = "Kaggle accepted the kernel; waiting for accelerator provisioning."
-        self.account_pool.begin_session(account_id, session.id, accelerator, model_id, session.launch_time)
+        self.account_pool.reserve_session(account_id, session.id, accelerator, model_id)
         session.monitor_thread = threading.Thread(
             target=self._monitor_session,
             args=(session,),
@@ -2610,6 +3060,13 @@ while True:
             name=f"kaggle-session-{session.id}",
         )
         session.monitor_thread.start()
+        if session.reverse_ssh_port:
+            threading.Thread(
+                target=self._watch_reverse_tunnel,
+                args=(session,),
+                daemon=True,
+                name=f"reverse-tunnel-{session.id}",
+            ).start()
         return {"success": True, "session_id": session.id, "status": session.status, "kernel_slug": session.kernel_slug}
 
     def _read_session_logs(self, session: KernelSession, seen: set[str]) -> Tuple[List[str], bool, str]:
@@ -2667,9 +3124,20 @@ while True:
                 failure_detail = line
         return fresh, intentional_idle, failure_detail
 
+    @staticmethod
+    def _extract_tunnel_url(text: str) -> str:
+        """Return a supported upstream URL from kernel output."""
+        match = re.search(
+            r"(?:https://[a-zA-Z0-9-]+\.trycloudflare\.com|http://127\.0\.0\.1:\d+)",
+            str(text or ""),
+        )
+        return match.group(0) if match else ""
+
     def _check_session_health(self, session: KernelSession) -> bool:
         if not session.tunnel_url:
             return False
+        if session.tunnel_url.startswith("relay://"):
+            return bool(self.relay_hub and self.relay_hub.is_online(session.id))
         client = requests.Session()
         client.trust_env = False
         headers = {"Authorization": f"Bearer {self.upstream_api_key or self.client_api_key}"}
@@ -2684,6 +3152,49 @@ while True:
             except Exception:
                 continue
         return False
+
+    def _watch_reverse_tunnel(self, session: KernelSession) -> None:
+        """Publish a reverse SSH upstream as soon as its loopback listener is healthy.
+
+        The remote port is reserved before the Kaggle push, so the controller can
+        probe it without waiting for the next Kaggle log snapshot. This avoids a
+        10-second discovery delay during the short interval between model startup
+        and a platform-side worker cancellation. A successful HTTP health probe,
+        rather than an ssh process existing, is the readiness signal.
+        """
+        if not session.reverse_ssh_port:
+            return
+        candidate = f"http://127.0.0.1:{int(session.reverse_ssh_port)}"
+        client = requests.Session()
+        client.trust_env = False
+        deadline = session.launch_time + 45 * 60
+        while not session.stop_event.is_set() and time.time() < deadline:
+            try:
+                response = client.get(candidate + "/health", timeout=0.75)
+                if response.status_code == 200:
+                    with self._state_lock:
+                        if session.stop_event.is_set() or session.status in {"failed", "stopped"}:
+                            return
+                        old_url = session.tunnel_url
+                        session.tunnel_url = candidate
+                        session.status = "health_check"
+                        session.status_detail = "Reverse tunnel is healthy; promoting upstream."
+                        if session.id == self.active_session_id:
+                            self.tunnel_url = candidate
+                    if old_url != candidate:
+                        self.log(f"[REVERSE TUNNEL] Healthy listener discovered for {session.id}: {candidate}")
+                    self._session_ready(session)
+                    return
+            except requests.RequestException:
+                pass
+            session.stop_event.wait(0.25)
+
+    @staticmethod
+    def _session_boot_timeout_reached(session: KernelSession, now: Optional[float] = None) -> bool:
+        """Queue time never expires a launch; only 30 minutes of actual RUNNING boot time does."""
+        if session.provisioning_started_at is None:
+            return False
+        return (float(now or time.time()) - session.provisioning_started_at) >= 30 * 60
 
     def _monitor_session(self, session: KernelSession) -> None:
         seen: set[str] = set()
@@ -2727,9 +3238,19 @@ while True:
                         session.status_detail = "Active upstream health check failed; self-healing tunnel/server in progress."
                         if session.id == self.active_session_id:
                             self.set_status("recovering", session.status_detail)
-            if "running" in lowered and session.status in {"queued", "pushing", "initializing"}:
-                session.status = "booting"
-                session.status_detail = "Accelerator allocated; loading model and opening Tunnel B."
+            session.last_kaggle_state = status_text.strip()
+            if "running" in lowered:
+                if session.provisioning_started_at is None:
+                    session.provisioning_started_at = time.time()
+                    self.account_pool.begin_session(
+                        session.account_id, session.id, session.accelerator, session.model_id,
+                        session.provisioning_started_at,
+                    )
+                    queue_seconds = session.provisioning_started_at - session.launch_time
+                    self.log(f"[{session.role.upper()}:{session.id}] Kaggle accelerator provisioned after {queue_seconds:.1f}s in queue.")
+                if session.status in {"queued", "pushing", "initializing", "eta_warning"}:
+                    session.status = "booting"
+                    session.status_detail = "Accelerator allocated; loading model and opening the inference channel."
             lines, idle_marker, remote_failure = self._read_session_logs(session, seen)
             intentional_idle = intentional_idle or idle_marker
             for line in lines:
@@ -2738,10 +3259,10 @@ while True:
                 if any(term in lowered_line for term in ("step 2/6", "loading the weights", "loading model", "weights on the chips", "downloading gguf")):
                     session.status = "loading_model"
                     session.status_detail = "Loading model weights onto the accelerator."
-                match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
-                if match and match.group(0) != session.tunnel_url:
+                discovered_url = self._extract_tunnel_url(line)
+                if discovered_url and discovered_url != session.tunnel_url:
                     old_url = session.tunnel_url
-                    session.tunnel_url = match.group(0)
+                    session.tunnel_url = discovered_url
                     session.status = "health_check"
                     session.status_detail = "New or rotated tunnel discovered; probing health."
                     if session.id == self.active_session_id:
@@ -2765,9 +3286,13 @@ while True:
                 self._session_ready(session)
                 ready_announced = True
             elapsed = time.time() - session.launch_time
-            if not ready_announced and elapsed > MAX_BOOT_SECONDS:
+            boot_elapsed = time.time() - (session.provisioning_started_at or session.launch_time)
+            if not ready_announced and session.provisioning_started_at is None and elapsed > MAX_BOOT_SECONDS:
                 session.status = "eta_warning"
-                session.status_detail = "Warm-up exceeded the 15 minute ETA; Kaggle is still provisioning."
+                session.status_detail = "Kaggle accelerator queue exceeded the 15 minute ETA; launch remains queued without being cancelled."
+            elif not ready_announced and session.provisioning_started_at is not None and boot_elapsed > MAX_BOOT_SECONDS:
+                session.status = "eta_warning"
+                session.status_detail = "Accelerator boot exceeded the 15 minute ETA; model/tunnel startup is still being monitored."
             if "complete" in lowered:
                 if intentional_idle and session.id == self.active_session_id:
                     self.handle_session_shutdown(session.id, "idle", "Kernel idle timer ended the session")
@@ -2780,23 +3305,31 @@ while True:
                 )):
                     self._handle_session_failure(session, f"Active upstream stayed unreachable for 60 seconds; Kaggle status: {status_text}")
                     return
-            if not ready_announced and attempts >= 180:
-                self._handle_session_failure(session, "Kernel did not become healthy within 30 minutes")
+            # Kaggle queue time is outside our control and must never consume the model boot timeout.
+            # Start the 30-minute hard failure window only after Kaggle reports RUNNING/provisioned.
+            if not ready_announced and self._session_boot_timeout_reached(session):
+                detail = session.last_error or "Kernel did not become healthy within 30 minutes after accelerator provisioning"
+                self._handle_session_failure(session, detail)
                 return
 
     def _session_ready(self, session: KernelSession) -> None:
-        if session.status == "ready":
-            return
-        session.status = "ready"
-        session.ready_time = time.time()
-        session.status_detail = "Healthy /v1/models response received."
+        with self._state_lock:
+            if session.status == "ready" or session.stop_event.is_set():
+                return
+            session.status = "ready"
+            session.ready_time = time.time()
+            session.status_detail = "Healthy upstream response received."
         self.consecutive_launch_failures = 0
         self.circuit_open_until = 0.0
         self.circuit_backoff_seconds = 60
         self.prewarm_warning = ""
-        boot_seconds = session.ready_time - session.launch_time
+        boot_seconds = session.ready_time - (session.provisioning_started_at or session.launch_time)
+        queue_seconds = max(0.0, (session.provisioning_started_at or session.launch_time) - session.launch_time)
         self.account_pool.record_boot(session.account_id, session.accelerator, boot_seconds)
-        self.log(f"[{session.role.upper()}] {session.id} ready in {boot_seconds:.1f}s at {session.tunnel_url}")
+        self.log(
+            f"[{session.role.upper()}] {session.id} ready after {queue_seconds:.1f}s queued + "
+            f"{boot_seconds:.1f}s boot at {session.tunnel_url}"
+        )
         if session.role == "prewarm":
             self.account_pool.mark(session.account_id, "HOT_STANDBY")
             self._hot_swap(session)
@@ -2873,6 +3406,8 @@ while True:
         lowered = reason.lower()
         if any(term in lowered for term in ("401", "403", "unauthorized", "forbidden", "invalid api", "authentication")):
             return "INVALID_KEY"
+        if any(term in lowered for term in ("cancelacknowledged", "cancel_acknowledged", "cancel acknowledged", "externally cancelled", "externally canceled")):
+            return "TRANSIENT_CANCEL"
         if any(term in lowered for term in ("9-hour", "session cap", "max_runtime")):
             return "SESSION_LIMIT"
         if any(term in lowered for term in ("weekly quota", "quota exceeded", "exceeded your quota", "quota limit", "accelerator quota", "usage limit")):
@@ -2915,12 +3450,15 @@ while True:
         session.status_detail = reason[:500]
         session.stop_event.set()
         self.account_pool.end_session(session.account_id, session.id)
+        if self.relay_hub:
+            self.relay_hub.unregister(session.id, reason)
+        self._cleanup_reverse_ssh_access(session)
         failure_status = self._classify_account_failure(reason)
         if failure_status == "QUOTA_EXHAUSTED":
             self.account_pool.mark_quota_exhausted(session.account_id, session.accelerator, reason)
         elif failure_status == "INVALID_KEY":
             self.account_pool.set_verification(session.account_id, False, reason)
-        elif failure_status == "SESSION_LIMIT":
+        elif failure_status in {"SESSION_LIMIT", "TRANSIENT_CANCEL"}:
             self.account_pool.mark(session.account_id, "VERIFIED_READY")
         else:
             self.account_pool.mark(session.account_id, "COOLDOWN", reason, cooldown_seconds=60)
@@ -3083,6 +3621,9 @@ while True:
             except Exception as exc:
                 self.log(f"Stop fallback failed for {session.id}: {exc}")
         self.account_pool.end_session(session.account_id, session.id)
+        if self.relay_hub:
+            self.relay_hub.unregister(session.id, reason)
+        self._cleanup_reverse_ssh_access(session)
         session.status = "stopped"
         session.status_detail = reason
         account = self.account_pool.get(session.account_id)
@@ -3166,7 +3707,7 @@ while True:
         active = self._active_session()
         if not active or active.status != "ready" or not active.tunnel_url or self._warming_session():
             return None
-        session_remaining = max(0.0, SESSION_LIMIT_SECONDS - (time.time() - active.launch_time))
+        session_remaining = max(0.0, SESSION_LIMIT_SECONDS - (time.time() - (active.provisioning_started_at or active.launch_time)))
         weekly_remaining = self.account_pool.remaining_seconds(active.account_id, active.accelerator)
         usable_keys = self._usable_key_count(active.accelerator)
         if weekly_remaining <= PREWARM_LEAD_SECONDS:
@@ -3196,6 +3737,13 @@ while True:
     def push_kernel(self, model_id: str) -> Dict[str, Any]:
         self._stop_failover.clear()
         self.clear_recovery_state()
+        # A dashboard model switch is an explicit replacement. Stop every local managed
+        # session first; the canonical Kaggle slug cleanup below handles stale sessions
+        # left behind by restarts or older model-specific releases.
+        with self._state_lock:
+            existing_sessions = [item for item in self.sessions.values() if item.status not in {"stopped", "failed"}]
+        for existing in existing_sessions:
+            self._stop_session(existing, "replaced by dashboard launch")
         model_id = normalize_model_id(model_id)
         model = MODELS.get(model_id, {})
         if not self.model_is_compatible(model_id):

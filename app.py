@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import hmac
 import os
 import secrets
 import threading
@@ -19,6 +20,7 @@ from kaggle_manager import KaggleKernelManager
 from models_registry import MODELS, DEFAULT_MODEL_ID, save_custom_model, load_custom_models, normalize_model_id
 from proxy_service import InferenceProxy
 from webshare_manager import ProxyRouteError
+from relay_service import OutboundRelayHub
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("uncensored_service")
@@ -147,6 +149,9 @@ sync_config()
 # ==============================================================================
 
 app_manager = FastAPI(title="Kaggle Uncensored AI Agent Manager", version="1.0.0")
+app_relay = FastAPI(title="GPU Hub Kaggle Outbound Relay", version="1.0.0")
+relay_hub = OutboundRelayHub()
+manager.relay_hub = relay_hub
 app_manager.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -691,7 +696,59 @@ inference_proxy = InferenceProxy(
     mock_mode_getter=lambda: bool(mock_mode),
     mock_completion_factory=generate_mock_completion,
     auto_wake_getter=lambda: bool(auto_wake),
+    relay_hub=relay_hub,
 )
+
+
+def _relay_authorized(request: Request, session_id: str) -> bool:
+    session = manager._session_by_id(session_id)
+    auth = request.headers.get("authorization", "")
+    supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return bool(session and session.relay_token and supplied and hmac.compare_digest(supplied, session.relay_token))
+
+
+@app_relay.post("/register")
+async def relay_register(request: Request):
+    data = await request.json()
+    session_id = str(data.get("session_id") or "")
+    if not _relay_authorized(request, session_id):
+        raise HTTPException(status_code=401, detail="Invalid relay session token")
+    session = manager._session_by_id(session_id)
+    relay_hub.register(session_id, session.relay_token)
+    if not manager.register_session_relay(session_id):
+        relay_hub.unregister(session_id, "Unknown or stopped Kaggle session")
+        raise HTTPException(status_code=404, detail="Unknown or stopped Kaggle session")
+    sync_config()
+    return {"success": True, "session_id": session_id}
+
+
+@app_relay.post("/poll")
+async def relay_poll(request: Request):
+    data = await request.json()
+    session_id = str(data.get("session_id") or "")
+    if not _relay_authorized(request, session_id) or not relay_hub.authenticate(
+        session_id, request.headers.get("authorization", "")[7:].strip()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid relay session token")
+    job = await relay_hub.poll(session_id, float(data.get("timeout") or 20))
+    if not job:
+        return Response(status_code=204)
+    return job
+
+
+@app_relay.post("/result")
+async def relay_result(request: Request):
+    data = await request.json()
+    session_id = str(data.get("session_id") or "")
+    if not _relay_authorized(request, session_id) or not relay_hub.authenticate(
+        session_id, request.headers.get("authorization", "")[7:].strip()
+    ):
+        raise HTTPException(status_code=401, detail="Invalid relay session token")
+    accepted = relay_hub.resolve(
+        session_id, str(data.get("job_id") or ""), int(data.get("status_code") or 502),
+        data.get("headers") or {}, str(data.get("body_b64") or ""),
+    )
+    return {"success": accepted}
 
 
 @app_manager.get("/v1/models")
@@ -702,7 +759,7 @@ async def list_models(request: Request):
     inference_proxy.authenticate(request)
     data = []
     live_ctx = None
-    if manager.tunnel_url:
+    if manager.tunnel_url and not manager.tunnel_url.startswith("relay://"):
         try:
             client = inference_proxy.closeable_client()
             response = await client.get(
@@ -716,8 +773,8 @@ async def list_models(request: Request):
             pass
     for model in MODELS.values():
         context = int(model.get("context_length", 65536))
-        if model["id"] == manager.active_model_id and live_ctx:
-            context = max(context, int(live_ctx))
+        if model["id"] == manager.active_model_id:
+            context = int(live_ctx or model.get("runtime_context_length") or context)
         data.append({
             "id": model["id"], "object": "model", "created": 1727000000, "owned_by": "gpu-hub",
             "permission": [], "root": model["id"], "parent": None,
@@ -735,7 +792,7 @@ async def list_models(request: Request):
 @app_forwarder.get("/v1/props")
 async def get_props(request: Request):
     inference_proxy.authenticate(request)
-    if manager.tunnel_url:
+    if manager.tunnel_url and not manager.tunnel_url.startswith("relay://"):
         try:
             response = await inference_proxy.closeable_client().get(
                 f"{manager.tunnel_url.rstrip('/')}/props",
@@ -747,7 +804,7 @@ async def get_props(request: Request):
         except Exception:
             pass
     active_model = MODELS.get(manager.active_model_id, {})
-    context = int(active_model.get("context_length", 65536))
+    context = int(active_model.get("runtime_context_length") or active_model.get("context_length", 32768))
     return {"default_generation_settings": {"n_ctx": context}, "model_alias": manager.active_model_id, "n_ctx": context}
 
 
@@ -830,6 +887,13 @@ async def run_servers():
     server_fwd = uvicorn.Server(config_fwd)
 
     servers = [server_mgr_local, server_fwd]
+    relay_bind = os.environ.get("GPU_HUB_RELAY_BIND", "").strip()
+    relay_port = int(os.environ.get("GPU_HUB_RELAY_PORT", "8777") or 8777)
+    if relay_bind:
+        servers.append(uvicorn.Server(uvicorn.Config(
+            app_relay, host=relay_bind, port=relay_port, log_level="warning", access_log=False,
+        )))
+        logger.info(f"Starting authenticated Kaggle outbound relay on {relay_bind}:{relay_port}")
     if ts_ip and ts_ip != "127.0.0.1":
         servers.insert(0, uvicorn.Server(uvicorn.Config(
             app_manager,

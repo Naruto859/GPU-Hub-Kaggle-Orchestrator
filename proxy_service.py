@@ -65,6 +65,7 @@ class InferenceProxy:
         mock_mode_getter: Callable[[], bool],
         mock_completion_factory: Callable[[dict], dict],
         auto_wake_getter: Callable[[], bool],
+        relay_hub: Any = None,
     ):
         self.manager = manager
         self.models = models
@@ -72,6 +73,7 @@ class InferenceProxy:
         self.mock_mode_getter = mock_mode_getter
         self.mock_completion_factory = mock_completion_factory
         self.auto_wake_getter = auto_wake_getter
+        self.relay_hub = relay_hub
         self.gates = {1: FairGate(1), 3: FairGate(3)}
         self._client: Optional[httpx.AsyncClient] = None
         self._wake_lock = asyncio.Lock()
@@ -101,7 +103,8 @@ class InferenceProxy:
         """Use the active upstream alias and keep requested output inside context."""
         normalized = dict(body or {})
         normalized["model"] = self.manager.active_model_id
-        context = int(self.active_model().get("context_length") or 65536)
+        model = self.active_model()
+        context = int(model.get("runtime_context_length") or model.get("context_length") or 32768)
         prompt_chars = len(json.dumps(normalized.get("messages", normalized.get("prompt", "")), ensure_ascii=False))
         estimated_prompt_tokens = max(1, prompt_chars // 4)
         safe_max = max(1, context - estimated_prompt_tokens - 256)
@@ -206,12 +209,29 @@ class InferenceProxy:
             client = self.closeable_client()
             upstream = f"{upstream_url.rstrip('/')}{path}"
             try:
-                if is_stream:
+                if upstream_url.startswith("relay://"):
+                    if not self.relay_hub:
+                        raise ConnectionError("Outbound relay is not configured")
+                    session_id = upstream_url.split("://", 1)[1]
+                    relayed = await self.relay_hub.submit(
+                        session_id, path, body, self.upstream_headers(), timeout=600.0
+                    )
+                    relay_content = relayed.get("content") or b""
+                    relay_response_args = {
+                        "status_code": int(relayed.get("status_code") or 502),
+                        "headers": relayed.get("headers") or {"content-type": "application/json"},
+                    }
+                    if is_stream:
+                        relay_response_args["stream"] = httpx.ByteStream(relay_content)
+                    else:
+                        relay_response_args["content"] = relay_content
+                    response = httpx.Response(**relay_response_args)
+                elif is_stream:
                     request = client.build_request("POST", upstream, json=body, headers=self.upstream_headers())
                     response = await client.send(request, stream=True)
                 else:
                     response = await client.post(upstream, json=body, headers=self.upstream_headers())
-            except (httpx.TransportError, OSError, ConnectionError) as exc:
+            except (httpx.TransportError, OSError, ConnectionError, asyncio.TimeoutError) as exc:
                 last_error = exc
                 await self._finish(gate, upstream_url)
                 if attempt >= 3:

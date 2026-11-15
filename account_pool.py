@@ -395,6 +395,20 @@ class KaggleAccountPool:
             self._save_locked()
             return dict(account)
 
+    def reserve_session(self, account_id: str, session_id: str, accelerator: str, model_id: str) -> None:
+        """Reserve an account while Kaggle queues it without charging accelerator runtime."""
+        with self._lock:
+            account = next((item for item in self._data["accounts"] if item["id"] == account_id), None)
+            if not account:
+                raise KeyError(account_id)
+            now = time.time()
+            self._refresh_week_locked(account, now)
+            account.update({
+                "session_started_at": 0.0, "session_accelerator": accelerator,
+                "session_id": session_id, "session_model_id": model_id, "updated_at": now,
+            })
+            self._save_locked()
+
     def begin_session(self, account_id: str, session_id: str, accelerator: str, model_id: str, started_at: Optional[float] = None) -> None:
         with self._lock:
             account = next((item for item in self._data["accounts"] if item["id"] == account_id), None)
@@ -413,12 +427,13 @@ class KaggleAccountPool:
     def end_session(self, account_id: str, session_id: Optional[str] = None, ended_at: Optional[float] = None) -> float:
         with self._lock:
             account = next((item for item in self._data["accounts"] if item["id"] == account_id), None)
-            if not account or not account.get("session_started_at"):
+            if not account:
                 return 0.0
             if session_id and account.get("session_id") != session_id:
                 return 0.0
             now = ended_at or time.time()
-            duration = max(0.0, now - float(account["session_started_at"]))
+            started_at = float(account.get("session_started_at") or 0.0)
+            duration = max(0.0, now - started_at) if started_at else 0.0
             accelerator = account.get("session_accelerator")
             if accelerator in QUOTA_SECONDS:
                 field = f"{accelerator}_used_seconds"

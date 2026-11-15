@@ -18,6 +18,7 @@ import models_registry as registry
 from account_pool import KaggleAccountPool, QUOTA_SECONDS, WEEK_SECONDS
 from models_registry import MODELS
 from proxy_service import InferenceProxy
+from relay_service import OutboundRelayHub
 from webshare_manager import ProxyRouteError
 
 
@@ -121,23 +122,12 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(manager.status, "quota_wait")
             self.assertFalse(manager._circuit_allows_attempt())
 
-    def test_qwen_tpu_bundle_and_custom_model_persistence(self):
+    def test_qwen_tpu_path_is_disabled_until_live_verified_and_custom_model_persists(self):
         manager = km.KaggleKernelManager()
-        manager.client_api_key = "sk-test-123456789"
-        manager.upstream_api_key = manager.client_api_key
         manager.accelerator_mode = "tpu"
-        manager.resolve_kernel_identity = lambda force=False, model_id=None, account_id=None, accelerator=None: ("friend", "qwen38-tpu-serve", "Qwen38 TPU")
-        old_runtime = km.RUNTIME_BUNDLE_DIR
+        self.assertFalse(manager.model_is_compatible("qwen3.8-27b-instruct"))
         old_custom = registry.CUSTOM_MODELS_PATH
         with tempfile.TemporaryDirectory() as directory:
-            km.RUNTIME_BUNDLE_DIR = Path(directory) / "bundles"
-            session = km.KernelSession("qwen", "test", "account", "qwen3.8-27b-instruct", "tpu")
-            bundle = manager._prepare_session_bundle(session)
-            metadata = json.loads((bundle / "kernel-metadata.json").read_text())
-            self.assertTrue(metadata["enable_tpu"])
-            self.assertEqual(metadata["dataset_sources"], km.QWEN_TPU_DATASETS)
-            compile((bundle / "kernel.py").read_text(), "<qwen-tpu>", "exec")
-
             registry.CUSTOM_MODELS_PATH = Path(directory) / "custom_models.json"
             custom = registry.save_custom_model({
                 "name": "Example Coder", "repo_id": "example/coder-gguf",
@@ -146,7 +136,6 @@ class LifecycleTests(unittest.TestCase):
             self.assertTrue(registry.CUSTOM_MODELS_PATH.exists())
             self.assertEqual(registry.load_custom_models()[custom["id"]]["context_length"], 65536)
             registry.MODELS.pop(custom["id"], None)
-        km.RUNTIME_BUNDLE_DIR = old_runtime
         registry.CUSTOM_MODELS_PATH = old_custom
 
     def test_launch_session_retries_409_with_existing_slug(self):
@@ -162,19 +151,20 @@ class LifecycleTests(unittest.TestCase):
 
             def prepare(session):
                 session.bundle_dir = bundle
-                session.kernel_slug = "user1/new-slug"
-                session.kernel_title = "New Slug"
+                session.kernel_slug = f"user1/{km.CANONICAL_GPU_SLUG}"
+                session.kernel_title = km.CANONICAL_GPU_TITLE
                 (bundle / "kernel.py").write_text("print('ok')\n")
                 (bundle / "kernel-metadata.json").write_text(json.dumps({"id": session.kernel_slug, "title": session.kernel_title}))
                 return bundle
 
             manager._prepare_session_bundle = prepare
-            manager.fetch_existing_kernels = lambda force=False, account_id=None: [{"ref": "user1/gpu-engine", "slug": "gpu-engine", "title": "GPU Engine", "owner": "user1"}]
+            manager._delete_managed_gpu_kernels = lambda account_id: []
+            manager.fetch_existing_kernels = lambda force=False, account_id=None: [{"ref": f"user1/{km.CANONICAL_GPU_SLUG}", "slug": km.CANONICAL_GPU_SLUG, "title": km.CANONICAL_GPU_TITLE, "owner": "user1"}]
             manager._monitor_session = lambda session: None
 
             class Conflict:
                 returncode = 1
-                stdout = "409 Conflict: notebook (user1/gpu-engine) already in use"
+                stdout = f"409 Conflict: notebook (user1/{km.CANONICAL_GPU_SLUG}) already in use"
                 stderr = ""
 
             class Success:
@@ -186,16 +176,14 @@ class LifecycleTests(unittest.TestCase):
                 result = manager._launch_session(ids[0], "cybertiel-coder-35b-a3b", "test")
             self.assertTrue(result["success"])
             self.assertEqual(run.call_count, 2)
-            self.assertEqual(manager.sessions[result["session_id"]].kernel_slug, "user1/gpu-engine")
+            self.assertEqual(manager.sessions[result["session_id"]].kernel_slug, f"user1/{km.CANONICAL_GPU_SLUG}")
 
-    def test_non_default_gpu_model_uses_model_specific_kernel_slug(self):
+    def test_all_gpu_models_use_canonical_kernel_slug(self):
         with tempfile.TemporaryDirectory() as directory:
             pool, ids = make_pool(Path(directory), 1)
             manager = km.KaggleKernelManager()
             manager.account_pool = pool
-            manager.fetch_existing_kernels = lambda force=False, account_id=None: [
-                {"ref": "user1/gpu-engine", "slug": "gpu-engine", "title": "GPU Engine", "owner": "user1"}
-            ]
+            manager.fetch_existing_kernels = lambda force=False, account_id=None: []
             owner, slug, title = manager.resolve_kernel_identity(
                 force=True,
                 model_id="qwen3.8-35b-a3b-distill",
@@ -203,9 +191,44 @@ class LifecycleTests(unittest.TestCase):
                 accelerator="gpu",
             )
             self.assertEqual(owner, "user1")
-            self.assertEqual(slug, "gpu-hub-qwen3-8-35b-a3b-distill")
-            self.assertEqual(title, "GPU Hub qwen3.8-35b-a3b-distill")
-            self.assertLessEqual(len(title), 50)
+            self.assertEqual(slug, km.CANONICAL_GPU_SLUG)
+            self.assertEqual(title, km.CANONICAL_GPU_TITLE)
+
+    def test_gpu_bundle_uses_session_specific_managed_slug(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_runtime = km.RUNTIME_BUNDLE_DIR
+            try:
+                km.RUNTIME_BUNDLE_DIR = Path(directory)
+                manager = km.KaggleKernelManager()
+                manager.client_api_key = manager.upstream_api_key = "test-key"
+                manager.resolve_kernel_identity = lambda **kwargs: ("user1", km.CANONICAL_GPU_SLUG, km.CANONICAL_GPU_TITLE)
+                manager._prepare_reverse_ssh_access = lambda session: {}
+                session = km.KernelSession("abcdef123456", "active", "account", "gemma-4-26b-a4b-it", "gpu")
+                bundle = manager._prepare_session_bundle(session)
+                metadata = json.loads((bundle / "kernel-metadata.json").read_text())
+                self.assertEqual(session.kernel_slug, "user1/uncensored-llm-runner-abcdef12")
+                self.assertEqual(metadata["id"], session.kernel_slug)
+                self.assertTrue(km.KaggleKernelManager._is_managed_gpu_slug("uncensored-llm-runner-abcdef12"))
+            finally:
+                km.RUNTIME_BUNDLE_DIR = old_runtime
+
+    def test_post_push_adopts_actual_kaggle_slug(self):
+        manager = km.KaggleKernelManager()
+        session = km.KernelSession("s", "active", "account", "gemma-4-26b-a4b-it", "gpu")
+        session.kernel_slug = "user/requested-slug"
+        session.kernel_title = km.CANONICAL_GPU_TITLE
+        manager._adopt_actual_pushed_identity(
+            session,
+            "Kernel version 1 successfully pushed. https://www.kaggle.com/code/user/actual-slug",
+        )
+        self.assertEqual(session.kernel_slug, "user/actual-slug")
+
+    def test_queue_time_never_trips_boot_timeout_before_accelerator_runs(self):
+        queued = km.KernelSession("queued", "active", "account", "gemma-4-26b-a4b-it", "gpu", launch_time=1.0)
+        self.assertFalse(km.KaggleKernelManager._session_boot_timeout_reached(queued, now=10_000.0))
+        queued.provisioning_started_at = 100.0
+        self.assertFalse(km.KaggleKernelManager._session_boot_timeout_reached(queued, now=1_899.0))
+        self.assertTrue(km.KaggleKernelManager._session_boot_timeout_reached(queued, now=1_900.0))
 
     def test_non_default_409_never_adopts_unrelated_legacy_gpu_kernel(self):
         manager = km.KaggleKernelManager()
@@ -539,13 +562,13 @@ class V5RouteAndModelTests(unittest.TestCase):
         self.assertFalse(manager.model_is_compatible("glm-5.3-flash"))
         self.assertTrue(manager.model_is_compatible("qwen3.8-27b-instruct"))
         manager.accelerator_mode = "tpu"
-        self.assertTrue(manager.model_is_compatible("qwen3.8-27b-instruct"))
+        self.assertFalse(manager.model_is_compatible("qwen3.8-27b-instruct"))
         with tempfile.TemporaryDirectory() as directory:
             old_runtime = km.RUNTIME_BUNDLE_DIR
             km.RUNTIME_BUNDLE_DIR = Path(directory)
             manager.client_api_key = manager.upstream_api_key = "test-key"
-            manager.resolve_kernel_identity = lambda **kwargs: ("friend", "qwen38-tpu-serve", "Qwen TPU")
-            session = km.KernelSession("s", "test", "account", "qwen3.8-27b-instruct", "tpu")
+            manager.resolve_kernel_identity = lambda **kwargs: ("friend", "glm53-tpu-serve", "GLM TPU")
+            session = km.KernelSession("s", "test", "account", "glm-5.3-flash", "tpu")
             bundle = manager._prepare_session_bundle(session)
             metadata = json.loads((bundle / "kernel-metadata.json").read_text())
             self.assertTrue(metadata["enable_tpu"])
@@ -580,7 +603,9 @@ class V5RouteAndModelTests(unittest.TestCase):
             self.assertIn("resolve_gguf_filename", source)
             self.assertIn('llama_build = "b12395"', source)
             self.assertIn('"--host", "127.0.0.1", "--port", "8080"', source)
-            self.assertIn('"--protocol", "http2", "--edge-ip-version", "4"', source)
+            self.assertIn('cf_protocols = ("auto", "http2", "quic")', source)
+            self.assertIn('"-c", "32768"', source)
+            self.assertIn('all startup profiles failed', source)
 
 
 class ProxyQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -699,6 +724,158 @@ class ProxyQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["model"] == manager.active_model_id for item in attempts))
         self.assertTrue(all(1 <= item["max_tokens"] < 1024 for item in attempts))
         self.assertEqual(manager.active_requests, 0)
+
+
+class OutboundRelayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relay_round_trip_preserves_status_headers_and_body(self):
+        hub = OutboundRelayHub()
+        hub.register("session1", "token1")
+        submit = asyncio.create_task(hub.submit(
+            "session1", "/v1/chat/completions", {"messages": []},
+            {"Authorization": "Bearer upstream"}, timeout=2,
+        ))
+        job = await hub.poll("session1", timeout=1)
+        self.assertEqual(job["path"], "/v1/chat/completions")
+        accepted = hub.resolve(
+            "session1", job["id"], 200, {"content-type": "application/json"},
+            "eyJva2F5Ijp0cnVlfQ==",
+        )
+        self.assertTrue(accepted)
+        result = await submit
+        self.assertEqual(result["status_code"], 200)
+        self.assertEqual(result["content"], b'{"okay":true}')
+        self.assertTrue(hub.is_online("session1"))
+
+    async def test_proxy_forwards_over_relay_upstream(self):
+        class Manager:
+            active_model_id = "gemma-4-26b-a4b-it"
+            upstream_api_key = "upstream"
+            tunnel_url = "relay://session1"
+            status = "ready"
+            queued_requests = active_requests = 0
+            def model_spec(self, model_id): return MODELS[model_id]
+            def note_request_queued(self): self.queued_requests += 1
+            def note_request_aborted(self): self.queued_requests = max(0, self.queued_requests - 1)
+            def reserve_upstream(self):
+                self.queued_requests = max(0, self.queued_requests - 1); self.active_requests += 1
+                return self.tunnel_url
+            def release_upstream(self, upstream): self.active_requests = max(0, self.active_requests - 1)
+            def warmup_headers(self): return {}
+        hub = OutboundRelayHub(); hub.register("session1", "token1")
+        proxy = InferenceProxy(Manager(), MODELS, lambda: "client", lambda: False, lambda body: {}, lambda: False, relay_hub=hub)
+        async def worker():
+            job = await hub.poll("session1", timeout=1)
+            hub.resolve("session1", job["id"], 200, {"content-type": "application/json"}, "eyJjaG9pY2VzIjpbXX0=")
+        task = asyncio.create_task(worker())
+        response = await proxy.raw_proxy("/v1/chat/completions", {"model": "wrong", "messages": []}, False)
+        await task
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.body), {"choices": []})
+
+
+class ReverseSSHTransportTests(unittest.TestCase):
+    def test_reverse_ssh_credential_is_loopback_only_and_revocable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old_runtime = km.RUNTIME_BUNDLE_DIR
+            try:
+                km.RUNTIME_BUNDLE_DIR = Path(directory) / "runtime"
+                manager = km.KaggleKernelManager()
+                manager.reverse_ssh_host = "203.0.113.10"
+                manager.reverse_ssh_authorized_keys = Path(directory) / ".ssh" / "authorized_keys"
+                session = km.KernelSession("session1", "active", "account", "gemma-4-26b-a4b-it", "gpu")
+                config = manager._prepare_reverse_ssh_access(session)
+                authorized = manager.reverse_ssh_authorized_keys.read_text()
+                self.assertEqual(config["host"], "203.0.113.10")
+                self.assertGreater(config["remote_port"], 0)
+                self.assertIn(f'permitlisten="127.0.0.1:{config["remote_port"]}"', authorized)
+                self.assertIn("no-pty,no-agent-forwarding,no-X11-forwarding", authorized)
+                self.assertIn('permitopen="127.0.0.1:1"', authorized)
+                self.assertTrue(config["private_key_b64"])
+                manager._cleanup_reverse_ssh_access(session)
+                self.assertNotIn("gpuhub-session1", manager.reverse_ssh_authorized_keys.read_text())
+            finally:
+                km.RUNTIME_BUNDLE_DIR = old_runtime
+
+    def test_generated_kernel_prefers_reverse_ssh_without_downloading_cloudflare(self):
+        manager = km.KaggleKernelManager()
+        manager.client_api_key = manager.upstream_api_key = "test-key"
+        source = manager.generate_kernel_script(
+            "gemma-4-26b-a4b-it", "session1", "active", "gpu",
+            reverse_tunnel={
+                "host": "203.0.113.10", "user": "root", "server_port": 22,
+                "remote_port": 19081, "private_key_b64": "dGVzdA==",
+            },
+        )
+        compile(source, "generated-kernel.py", "exec")
+        self.assertIn("tunnel_started = spawn_reverse_ssh() if REVERSE_SSH_HOST else False", source)
+        self.assertIn('tunnel_url = f"http://127.0.0.1:{REVERSE_SSH_REMOTE_PORT}"', source)
+        self.assertIn("Downloading Cloudflare tunnel binary for fallback", source)
+        self.assertLess(source.index("tunnel_started = spawn_reverse_ssh()"), source.index("for tunnel_attempt in range"))
+
+    def test_tunnel_parser_accepts_cloudflare_and_reverse_ssh_urls(self):
+        self.assertEqual(
+            km.KaggleKernelManager._extract_tunnel_url(
+                "[TUNNEL ESTABLISHED] URL: http://127.0.0.1:58323 protocol=reverse-ssh"
+            ),
+            "http://127.0.0.1:58323",
+        )
+        self.assertEqual(
+            km.KaggleKernelManager._extract_tunnel_url(
+                "ready at https://example-123.trycloudflare.com/v1/models"
+            ),
+            "https://example-123.trycloudflare.com",
+        )
+
+    def test_generated_kernel_prefers_outbound_relay_before_tunnels(self):
+        manager = km.KaggleKernelManager()
+        manager.client_api_key = manager.upstream_api_key = "test-key"
+        manager.relay_url = "http://relay.example:8777"
+        session = km.KernelSession("session1", "active", "account", "gemma-4-26b-a4b-it", "gpu")
+        session.relay_token = "relay-token"
+        manager.sessions[session.id] = session
+        source = manager.generate_kernel_script(
+            session.model_id, session.id, session.role, session.accelerator, reverse_tunnel={}
+        )
+        compile(source, "generated-relay-kernel.py", "exec")
+        self.assertIn('RELAY_URL = "http://relay.example:8777"', source)
+        self.assertIn('RELAY_TOKEN = "relay-token"', source)
+        self.assertIn("def spawn_outbound_relay():", source)
+        self.assertLess(
+            source.index("tunnel_started = spawn_outbound_relay()"),
+            source.index("tunnel_started = spawn_reverse_ssh()"),
+        )
+
+    def test_external_cancel_is_transient_and_does_not_exhaust_the_key(self):
+        manager = km.KaggleKernelManager()
+        self.assertEqual(
+            manager._classify_account_failure('KernelWorkerStatus.CANCEL_ACKNOWLEDGED (externally cancelled)'),
+            "TRANSIENT_CANCEL",
+        )
+
+    def test_boot_and_session_runtime_start_at_accelerator_provisioning(self):
+        manager = km.KaggleKernelManager()
+        session = km.KernelSession(
+            "session1", "active", "account", "gemma-4-26b-a4b-it", "gpu",
+            launch_time=100.0, provisioning_started_at=10_000.0, ready_time=10_240.0,
+        )
+        with patch("kaggle_manager.time.time", return_value=10_300.0):
+            runtime_remaining = km.SESSION_LIMIT_SECONDS - (10_300.0 - (session.provisioning_started_at or session.launch_time))
+        self.assertEqual(runtime_remaining, km.SESSION_LIMIT_SECONDS - 300.0)
+        self.assertEqual(session.ready_time - (session.provisioning_started_at or session.launch_time), 240.0)
+
+    def test_gpu_cleanup_preserves_canonical_slug_and_deletes_legacy_slugs(self):
+        manager = km.KaggleKernelManager()
+        manager.fetch_existing_kernels = lambda force=False, account_id=None: [
+            {"ref": "friend/uncensored-llm-runner", "slug": "uncensored-llm-runner", "owner": "friend"},
+            {"ref": "friend/gpu-hub-old-model", "slug": "gpu-hub-old-model", "owner": "friend"},
+        ]
+        result = MagicMock(returncode=0, stdout="", stderr="")
+        manager._run_kaggle = MagicMock(return_value=result)
+        with patch("kaggle_manager.time.sleep"):
+            deleted = manager._delete_managed_gpu_kernels("account")
+        self.assertEqual(deleted, ["friend/gpu-hub-old-model"])
+        args = manager._run_kaggle.call_args.args[1]
+        self.assertEqual(args, ["kernels", "delete", "friend/gpu-hub-old-model", "-y"])
 
 
 if __name__ == "__main__":
