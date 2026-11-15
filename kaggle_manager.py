@@ -134,16 +134,17 @@ QWEN_TPU_DIR = BASE_DIR / "tpu_lab" / "qwen38_27b"
 GLM_DATASETS = [
     "rahim3/glm53-flash-iq3xxs-1",
     "rahim3/glm53-flash-iq3xxs-2",
-    "rahim3/glm53-flash-serve-v3",
-]
-GLM_FALLBACK_DATASETS = [
-    "rahim3/glm53-flash-iq3xxs-1",
-    "rahim3/glm53-flash-iq3xxs-2",
     "rahim3/glm53-flash-fp8-1",
     "rahim3/glm53-flash-fp8-2",
     "rahim3/glm53-flash-fp8-3",
     "rahim3/glm53-flash-fp8-4",
 ]
+GLM_FAST_DATASETS = [
+    "rahim3/glm53-flash-iq3xxs-1",
+    "rahim3/glm53-flash-iq3xxs-2",
+    "rahim3/glm53-flash-serve-v3",
+]
+GLM_FALLBACK_DATASETS = GLM_DATASETS
 QWEN_TPU_DATASETS = ["rahim3/qwen3-8-27b-bf16", "rahim3/qwen38-tpu-env-v5e8"]
 FAILOVER_COOLDOWN_SECONDS = 15
 RUNTIME_BUNDLE_DIR = Path("/tmp/gpu-hub-kernels")
@@ -191,6 +192,7 @@ class KernelSession:
     trigger_reason: str = ""
     kaggle_poll_frozen: bool = False
     health_failures: int = 0
+    tpu_recreate_attempts: int = 0
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     monitor_thread: Optional[threading.Thread] = field(default=None, repr=False)
 
@@ -217,6 +219,7 @@ class KernelSession:
             "eta_exceeded": elapsed > MAX_BOOT_SECONDS,
             "last_error": self.last_error,
             "kaggle_poll_frozen": self.kaggle_poll_frozen,
+            "tpu_recreate_attempts": self.tpu_recreate_attempts,
         }
 
 
@@ -419,6 +422,9 @@ class KaggleKernelManager:
         self._polling_thread = None
         self._stop_polling = threading.Event()
         self.kaggle_proxy = "server"
+        self.default_network_route = "server"
+        self.default_custom_proxy = ""
+        self.auto_key_rotation = True
         self.account_pool = KaggleAccountPool(ACCOUNT_POOL_PATH, DEFAULT_KAGGLE_CREDS)
         self.webshare = WebshareConnector()
         self.idle_timeout_min: float = IDLE_TIMEOUT_MIN_DEFAULT
@@ -471,12 +477,22 @@ class KaggleKernelManager:
     @staticmethod
     def _validate_proxy_choice(proxy: str) -> str:
         proxy = str(proxy or "server").strip() or "server"
-        if proxy in {"server", "webshare"}:
+        if proxy in {"default", "server", "webshare"}:
             return proxy
         parsed = urlsplit(proxy)
         if parsed.scheme.lower() not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname or not parsed.port:
             raise ValueError("Proxy must be 'webshare', 'server', or a valid http(s)/socks5 URL with a port")
         return proxy
+
+    def _effective_default_proxy(self) -> str:
+        mode = str(getattr(self, "default_network_route", "server") or "server").strip()
+        if mode == "custom":
+            return self._validate_proxy_choice(getattr(self, "default_custom_proxy", ""))
+        return self._validate_proxy_choice(mode)
+
+    def _effective_proxy_choice(self, proxy: str) -> str:
+        proxy = self._validate_proxy_choice(proxy)
+        return self._effective_default_proxy() if proxy == "default" else proxy
 
     def _proxy_queue_position(self, account_id: str) -> int:
         return next(
@@ -500,12 +516,13 @@ class KaggleKernelManager:
         account = self.account_pool.get(account_id)
         if not account:
             raise KeyError(account_id)
-        mode = self._validate_proxy_choice(account.get("proxy") or "server")
+        configured_mode = self._validate_proxy_choice(account.get("proxy") or "default")
+        mode = self._effective_proxy_choice(configured_mode)
         if mode == "server":
             return "server"
         if mode != "webshare":
             exit_ip = self.webshare.test_proxy(mode, force=True)
-            self.account_pool.update_proxy(account_id, mode, "", exit_ip)
+            self.account_pool.update_proxy(account_id, configured_mode, "", exit_ip)
             return mode
 
         with self._proxy_transition_lock:
@@ -545,17 +562,19 @@ class KaggleKernelManager:
                 proxies = rotated["proxies"]
                 proxy_url = proxies[0]["proxy_url"]
                 exit_ip = rotated["exit_ip"]
-                self.account_pool.update_proxy(account_id, "webshare", proxy_url, exit_ip)
+                self.account_pool.update_proxy(account_id, configured_mode, proxy_url, exit_ip)
                 self.log(
                     f"[PROXY SHIELD] Webshare exit changed for {purpose}; {account.get('username')} is pinned to {exit_ip}."
                 )
                 return proxy_url
 
-            used_ips = {
-                str(item.get("last_exit_ip") or "").strip()
-                for item in self.account_pool.list_public()
-                if item["id"] != account_id and item.get("proxy_mode") == "webshare" and item.get("last_exit_ip")
-            }
+            used_ips = set()
+            for item in self.account_pool.list_public():
+                if item["id"] == account_id or not item.get("last_exit_ip"):
+                    continue
+                raw = self.account_pool.get(item["id"]) or {}
+                if self._effective_proxy_choice(raw.get("proxy") or "default") == "webshare":
+                    used_ips.add(str(item.get("last_exit_ip") or "").strip())
             assigned = str(account.get("assigned_proxy_url") or "").strip()
             candidates = list(proxies)
             start = self._proxy_queue_position(account_id) % len(candidates)
@@ -570,7 +589,7 @@ class KaggleKernelManager:
                     continue
                 if len(proxies) >= 2 and exit_ip in used_ips:
                     continue
-                self.account_pool.update_proxy(account_id, "webshare", proxy_url, exit_ip)
+                self.account_pool.update_proxy(account_id, configured_mode, proxy_url, exit_ip)
                 return proxy_url
             raise ProxyRouteError("PROXY_ERROR: no distinct healthy Webshare exit IP is available for this account")
 
@@ -578,7 +597,7 @@ class KaggleKernelManager:
         account = self.get_current_account(account_id)
         if not account:
             return "server"
-        mode = str(account.get("proxy") or "server").strip()
+        mode = self._effective_proxy_choice(str(account.get("proxy") or "default").strip())
         if mode != "webshare":
             return mode
         assigned = str(account.get("assigned_proxy_url") or "").strip()
@@ -601,7 +620,9 @@ class KaggleKernelManager:
             raise ProxyRouteError(f"PROXY_ERROR: aborting Kaggle call to prevent VPS IP leak: {exc}") from exc
         account = self.get_current_account(account_id)
         if account:
-            self.account_pool.update_proxy(account["id"], account.get("proxy") or proxy, proxy if account.get("proxy") == "webshare" else "", exit_ip)
+            configured = account.get("proxy") or "default"
+            assigned = proxy if self._effective_proxy_choice(configured) == "webshare" else ""
+            self.account_pool.update_proxy(account["id"], configured, assigned, exit_ip)
         return proxy
 
     def _run_kaggle(
@@ -671,7 +692,7 @@ class KaggleKernelManager:
         }
 
     def detect_username_for_key(self, key: str, proxy: str = "server") -> Optional[str]:
-        proxy = self._validate_proxy_choice(proxy)
+        proxy = self._effective_proxy_choice(proxy)
         route = proxy
         if proxy == "webshare":
             candidate = self.webshare.proxy_for_index(0)
@@ -685,7 +706,12 @@ class KaggleKernelManager:
         proxy = self._validate_proxy_choice(proxy)
         if not self.account_pool.get(account_id):
             raise KeyError(account_id)
-        if proxy == "server":
+        if proxy == "default":
+            self.account_pool.update_proxy(account_id, "default", "", "")
+            effective = self._effective_default_proxy()
+            if effective != "server":
+                self._prepare_account_route(account_id, "account_config")
+        elif proxy == "server":
             return self.account_pool.update_proxy(account_id, "server", "", "")
         if proxy == "webshare":
             self.account_pool.update_proxy(account_id, "webshare", "", "")
@@ -694,6 +720,32 @@ class KaggleKernelManager:
             exit_ip = self.webshare.test_proxy(proxy, force=True)
             self.account_pool.update_proxy(account_id, proxy, "", exit_ip)
         return self.account_pool.get(account_id) or {}
+
+    def clear_recovery_state(self, account_id: Optional[str] = None) -> Dict[str, Any]:
+        cleared = self.account_pool.clear_cooldown(account_id)
+        self.consecutive_launch_failures = 0
+        self.circuit_open_until = 0.0
+        self.circuit_backoff_seconds = 60
+        self.prewarm_warning = ""
+        self._stop_failover.clear()
+        if not self._active_session() and not self._warming_session():
+            self.status = "idle"
+            self.status_detail = "Recovery state cleared. Ready to launch."
+            self.tunnel_url = ""
+            self.launch_time = None
+        if account_id:
+            account = self.account_pool.get(account_id)
+            if account and account.get("verified_at") and (self.account_pool.active() or {}).get("id") == account_id:
+                self.account_pool.mark(account_id, "ACTIVE")
+        return {"success": True, "cleared_accounts": cleared, "status": self.status}
+
+    def disconnect_webshare(self) -> Dict[str, Any]:
+        for account in self.account_pool.list_public():
+            if account.get("proxy_mode") == "webshare":
+                self.account_pool.update_proxy(account["id"], "server", "", "")
+        self.default_network_route = "server"
+        self.default_custom_proxy = ""
+        return self.webshare.disconnect()
 
     def test_account_proxy(self, account_id: str) -> Dict[str, Any]:
         proxy = self._prepare_account_route(account_id, "proxy_test")
@@ -708,11 +760,12 @@ class KaggleKernelManager:
         account = self.account_pool.get(account_id) or {}
         self.account_pool.update_proxy(
             account_id,
-            account.get("proxy") or proxy,
-            proxy if account.get("proxy") == "webshare" else "",
+            account.get("proxy") or "default",
+            proxy if self._effective_proxy_choice(account.get("proxy") or "default") == "webshare" else "",
             exit_ip,
         )
-        return {"mode": "webshare" if account.get("proxy") == "webshare" else "custom", "exit_ip": exit_ip}
+        effective = self._effective_proxy_choice(account.get("proxy") or "default")
+        return {"mode": "webshare" if effective == "webshare" else "custom", "exit_ip": exit_ip}
 
     def refresh_webshare_ip(self) -> Dict[str, Any]:
         """Rotate the shared Webshare endpoint without letting a live account leak onto the new IP."""
@@ -803,6 +856,7 @@ class KaggleKernelManager:
                     self.log(f"Account verification error for {account.get('username')}: {exc}")
 
     def activate_kaggle_account(self, account_id: str) -> Dict[str, Any]:
+        self.clear_recovery_state(account_id)
         active_session = self._active_session()
         if active_session and active_session.status == "ready" and active_session.account_id != account_id:
             account = self.account_pool.get(account_id)
@@ -1157,7 +1211,7 @@ class KaggleKernelManager:
         filename = model["filename"]
         filesize_gb = model["filesize_gb"]
         model_key = model["id"]
-        webhook_target = f"{self.webhook_host}/api/uncensored/tunnel/register"
+        webhook_target = f"{self.webhook_host}/api/tunnel/register"
         idle_timeout_min = float(getattr(self, "idle_timeout_min", IDLE_TIMEOUT_MIN_DEFAULT))
         max_runtime_min = float(getattr(self, "max_runtime_min", MAX_RUNTIME_MIN_DEFAULT))
 
@@ -1392,7 +1446,7 @@ if not tunnel_url:
 # Step 6: Notify VPS Webhook
 print("\\n[STEP 6] Reporting tunnel URL to VPS Manager...")
 try:
-    payload = json.dumps({{"tunnel_url": tunnel_url, "model_id": MODEL_ID, "status": "ready", "session_id": GPU_HUB_SESSION_ID, "session_role": GPU_HUB_SESSION_ROLE}}).encode("utf-8")
+    payload = json.dumps({"tunnel_url": tunnel_url, "model_id": MODEL_ID, "status": "ready", "session_id": GPU_HUB_SESSION_ID, "session_role": GPU_HUB_SESSION_ROLE}).encode("utf-8")
     req = urllib.request.Request(
         WEBHOOK_TARGET,
         data=payload,
@@ -1410,11 +1464,11 @@ print("=" * 70 + "\\n")
 
 # Step 7: Continuous Keepalive Loop with Auto-Shutdown Lifecycle
 print("[STEP 7] Entering keepalive loop with auto-shutdown lifecycle.")
-print(f"[LIFECYCLE] IDLE_TIMEOUT_MIN={{IDLE_TIMEOUT_MIN}} | MAX_RUNTIME_MIN={{MAX_RUNTIME_MIN}}")
+print(f"[LIFECYCLE] IDLE_TIMEOUT_MIN={IDLE_TIMEOUT_MIN} | MAX_RUNTIME_MIN={MAX_RUNTIME_MIN}")
 if IDLE_TIMEOUT_MIN and IDLE_TIMEOUT_MIN > 0:
-    print(f"[LIFECYCLE] Idle auto-shutdown: {{IDLE_TIMEOUT_MIN}} min without an inference request.")
+    print(f"[LIFECYCLE] Idle auto-shutdown: {IDLE_TIMEOUT_MIN} min without an inference request.")
 if MAX_RUNTIME_MIN and MAX_RUNTIME_MIN > 0:
-    print(f"[LIFECYCLE] Max runtime cap: {{MAX_RUNTIME_MIN}} min regardless of activity.")
+    print(f"[LIFECYCLE] Max runtime cap: {MAX_RUNTIME_MIN} min regardless of activity.")
 
 SESSION_START = time.time()
 
@@ -1431,7 +1485,7 @@ def read_last_activity():
 def post_shutdown_status(reason, detail):
     """Report the auto-shutdown to the VPS manager so the dashboard resets."""
     try:
-        payload = json.dumps({{
+        payload = json.dumps({
             "tunnel_url": "",
             "model_id": MODEL_ID,
             "status": "auto_shutdown",
@@ -1439,7 +1493,7 @@ def post_shutdown_status(reason, detail):
             "detail": detail,
             "session_id": GPU_HUB_SESSION_ID,
             "session_role": GPU_HUB_SESSION_ROLE,
-        }}).encode("utf-8")
+        }).encode("utf-8")
         req = urllib.request.Request(
             WEBHOOK_TARGET,
             data=payload,
@@ -1452,7 +1506,7 @@ def post_shutdown_status(reason, detail):
 
 def graceful_shutdown(reason, detail):
     """Kill children, notify the manager, and END the Kaggle GPU session."""
-    print(f"[AUTO-SHUTDOWN] {{reason}}: {{detail}}")
+    print(f"[AUTO-SHUTDOWN] {reason}: {detail}")
     print("[AUTO-SHUTDOWN] Killing llama-server, cloudflared and bridge, then exiting.")
     post_shutdown_status(reason, detail)
     for proc, name in ((server_proc, "llama-server"), (cf_proc, "cloudflared"), (bridge_proc, "early_ping_bridge")):
@@ -1460,14 +1514,14 @@ def graceful_shutdown(reason, detail):
             if proc.poll() is None:
                 proc.terminate()
         except Exception as e:
-            print(f"[AUTO-SHUTDOWN] terminate {{name}} failed: {{e}}")
+            print(f"[AUTO-SHUTDOWN] terminate {name} failed: {e}")
     time.sleep(2)
     for proc, name in ((server_proc, "llama-server"), (cf_proc, "cloudflared"), (bridge_proc, "early_ping_bridge")):
         try:
             if proc.poll() is None:
                 proc.kill()
         except Exception as e:
-            print(f"[AUTO-SHUTDOWN] kill {{name}} failed: {{e}}")
+            print(f"[AUTO-SHUTDOWN] kill {name} failed: {e}")
     print("[AUTO-SHUTDOWN] GPU released. Kaggle session ending.")
     sys.exit(0)
 
@@ -1481,7 +1535,7 @@ while True:
     if MAX_RUNTIME_MIN and MAX_RUNTIME_MIN > 0:
         runtime_min = (now - SESSION_START) / 60.0
         if runtime_min >= MAX_RUNTIME_MIN:
-            graceful_shutdown("max_runtime", f"max runtime reached after {{runtime_min:.1f}} min")
+            graceful_shutdown("max_runtime", f"max runtime reached after {runtime_min:.1f} min")
 
     # --- Auto-shutdown: idle timeout (skipped while a request may be in flight) ---
     if IDLE_TIMEOUT_MIN and IDLE_TIMEOUT_MIN > 0 and bridge_ready:
@@ -1490,11 +1544,11 @@ while True:
             last_activity, active_requests = activity
             idle_min = (now - last_activity) / 60.0
             if active_requests > 0:
-                print(f"[LIFECYCLE] {{active_requests}} inference request(s) active; idle shutdown suspended.")
+                print(f"[LIFECYCLE] {active_requests} inference request(s) active; idle shutdown suspended.")
             elif idle_min >= IDLE_TIMEOUT_MIN:
-                graceful_shutdown("idle", f"idle {{idle_min:.1f}} min, releasing GPU")
+                graceful_shutdown("idle", f"idle {idle_min:.1f} min, releasing GPU")
             elif idle_min > (IDLE_TIMEOUT_MIN / 2.0):
-                print(f"[LIFECYCLE] Idle for {{idle_min:.1f}} min of {{IDLE_TIMEOUT_MIN}} min threshold.")
+                print(f"[LIFECYCLE] Idle for {idle_min:.1f} min of {IDLE_TIMEOUT_MIN} min threshold.")
 
     # Check llama-server process health
     if server_proc.poll() is not None:
@@ -1516,7 +1570,7 @@ while True:
         break
 
     if tick % 4 == 0:
-        print(f"[HEARTBEAT] Elapsed: {{tick * 30}}s | Upstream {{tunnel_url}} is healthy and serving.")
+        print(f"[HEARTBEAT] Elapsed: {tick * 30}s | Upstream {tunnel_url} is healthy and serving.")
 '''
         return script_code
 
@@ -1542,7 +1596,11 @@ while True:
             "enable_gpu": not is_tpu,
             "enable_tpu": is_tpu,
             "enable_internet": True,
-            "dataset_sources": list(model.get("dataset_sources") or (GLM_DATASETS if is_tpu else [])),
+            "dataset_sources": list(
+                GLM_FAST_DATASETS
+                if model.get("kernel_workflow") == "glm53_tpu"
+                else model.get("dataset_sources") or (GLM_DATASETS if is_tpu else [])
+            ),
             "competition_sources": [],
             "kernel_sources": [],
             "model_sources": []
@@ -2186,6 +2244,133 @@ while True:
         self.log(f"[TPU DATASET FALLBACK] Retrying {session.kernel_slug} with: {', '.join(fallback)}")
         return True
 
+    @staticmethod
+    def _is_no_tpu_failure(reason: str) -> bool:
+        lowered = str(reason or "").lower()
+        return any(term in lowered for term in (
+            "this session has no working tpu",
+            "jax sees 1 cpu device",
+            '"step": "no-tpu"',
+            "step=no-tpu",
+        ))
+
+    def _delete_kernel_for_fresh_tpu(self, account_id: str, kernel_slug: str) -> None:
+        if not kernel_slug:
+            return
+        result = self._run_kaggle(account_id, ["kernels", "delete", kernel_slug, "-y"], timeout=45)
+        output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
+        if result.returncode == 0:
+            self.log(f"[TPU FRESH VM] Deleted prior kernel {kernel_slug} before re-creation.")
+        elif any(term in output.lower() for term in ("404", "not found", "does not exist")) or (
+            "403" in output and "deletekernel" in output.lower()
+        ):
+            self.log(f"[TPU FRESH VM] No prior kernel existed at {kernel_slug}; continuing.")
+        else:
+            raise RuntimeError(f"Kaggle kernel delete failed for {kernel_slug}: {kaggle_error_line(output)}")
+
+    def _set_tpu_retry_slug(self, session: KernelSession, retry_number: int) -> None:
+        owner, current = session.kernel_slug.split("/", 1)
+        base = re.sub(r"-r\d+$", "", current)
+        retry_slug = f"{base}-r{retry_number}"
+        session.kernel_slug = f"{owner}/{retry_slug}"
+        session.kernel_title = re.sub(r"\s+R\d+$", "", session.kernel_title or "TPU Serve") + f" R{retry_number}"
+        metadata_path = session.bundle_dir / "kernel-metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update({"id": session.kernel_slug, "title": session.kernel_title})
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    def _push_existing_session_bundle(self, session: KernelSession) -> Tuple[bool, str]:
+        result = self._run_kaggle(
+            session.account_id,
+            ["kernels", "push", "-p", str(session.bundle_dir)],
+            timeout=90,
+        )
+        output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
+        lowered = output.lower()
+        dataset_problem = any(term in lowered for term in ("not valid dataset", "dataset source", "dataset not found", "private dataset"))
+        if dataset_problem and self._apply_tpu_dataset_fallback(session, output):
+            result = self._run_kaggle(
+                session.account_id,
+                ["kernels", "push", "-p", str(session.bundle_dir)],
+                timeout=90,
+            )
+            output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
+            lowered = output.lower()
+            dataset_problem = any(term in lowered for term in ("not valid dataset", "dataset source", "dataset not found", "private dataset"))
+        failed = result.returncode != 0 or dataset_problem or "kernel push error:" in lowered or ("error:" in lowered and "successfully pushed" not in lowered)
+        return not failed, output
+
+    def _recreate_tpu_session(self, session: KernelSession, reason: str) -> bool:
+        """Recover Kaggle's CPU-only TPU allocation glitch without penalizing the account."""
+        session.tpu_recreate_attempts += 1
+        retry_number = session.tpu_recreate_attempts
+        if retry_number > 4:
+            session.status = "failed"
+            session.last_error = reason[:800]
+            session.status_detail = "Kaggle failed to attach a TPU after 4 automatic re-creations. Retry manually when TPU capacity improves."
+            session.stop_event.set()
+            self.account_pool.end_session(session.account_id, session.id)
+            account = self.account_pool.get(session.account_id)
+            if account and account.get("verified_at"):
+                status = "ACTIVE" if (self.account_pool.active() or {}).get("id") == session.account_id else "VERIFIED_READY"
+                self.account_pool.mark(session.account_id, status, session.status_detail)
+            with self._state_lock:
+                if self.active_session_id == session.id:
+                    self.active_session_id = None
+                    self.tunnel_url = ""
+                if self.warming_session_id == session.id:
+                    self.warming_session_id = None
+                self.launch_time = None
+            self.consecutive_launch_failures = 0
+            self.circuit_open_until = 0.0
+            self.set_status("error", session.status_detail)
+            self.log(f"[TPU AUTO-RECOVERY EXHAUSTED] {reason}")
+            return False
+
+        session.status = "recreating_tpu"
+        session.status_detail = f"Kaggle started VM without TPU — auto-recreating TPU session (retry {retry_number}/4)..."
+        self.status = "warming"
+        self.status_detail = session.status_detail
+        self.log(f"[TPU AUTO-RECOVERY {retry_number}/4] {reason}")
+        old_slug = session.kernel_slug
+        try:
+            self._delete_kernel_for_fresh_tpu(session.account_id, old_slug)
+            self._set_tpu_retry_slug(session, retry_number)
+            if session.stop_event.wait(10):
+                return False
+            ok, output = self._push_existing_session_bundle(session)
+        except Exception as exc:
+            ok, output = False, str(exc)
+        if not ok:
+            detail = f"TPU re-creation push failed without penalizing the account: {kaggle_error_line(output)}"
+            session.status = "failed"
+            session.last_error = detail[:800]
+            session.status_detail = detail[:500]
+            session.stop_event.set()
+            self.account_pool.end_session(session.account_id, session.id)
+            account = self.account_pool.get(session.account_id)
+            if account and account.get("verified_at"):
+                status = "ACTIVE" if (self.account_pool.active() or {}).get("id") == session.account_id else "VERIFIED_READY"
+                self.account_pool.mark(session.account_id, status, detail)
+            with self._state_lock:
+                if self.active_session_id == session.id:
+                    self.active_session_id = None
+                    self.tunnel_url = ""
+                if self.warming_session_id == session.id:
+                    self.warming_session_id = None
+                self.launch_time = None
+            self.consecutive_launch_failures = 0
+            self.circuit_open_until = 0.0
+            self.set_status("error", detail)
+            self.log(f"[TPU AUTO-RECOVERY STOPPED] {detail}")
+            return False
+        session.tunnel_url = ""
+        session.health_failures = 0
+        session.status = "queued"
+        session.status_detail = f"Fresh TPU VM requested successfully (retry {retry_number}/4); waiting for TPU provisioning."
+        self.log(f"[TPU AUTO-RECOVERY {retry_number}/4] Re-pushed as {session.kernel_slug}.")
+        return True
+
     def _launch_session(
         self,
         account_id: str,
@@ -2244,6 +2429,16 @@ while True:
         session.status = "pushing"
         session.status_detail = f"Pushing {session.kernel_slug} with {account['username']}"
         self.log(f"[{role.upper()}] Executing kaggle {' '.join(command)}")
+
+        if accelerator == "tpu":
+            try:
+                session.status_detail = f"Deleting stale TPU kernel {session.kernel_slug} before requesting a fresh VM."
+                self._delete_kernel_for_fresh_tpu(account_id, session.kernel_slug)
+                time.sleep(5)
+            except Exception as exc:
+                self._handle_session_failure(session, f"Fresh TPU kernel cleanup failed: {exc}")
+                return {"success": False, "error": str(exc), "session_id": session.id}
+
         def execute_push():
             return self._run_kaggle(account_id, command, timeout=90)
 
@@ -2255,7 +2450,13 @@ while True:
         output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
         lowered = output.lower()
         if result.returncode != 0 and any(term in lowered for term in ("409", "conflict", "already in use", "does not resolve to the specified id")):
-            if self._adopt_conflicting_kernel(session, output):
+            if accelerator == "tpu":
+                self._delete_kernel_for_fresh_tpu(account_id, session.kernel_slug)
+                time.sleep(5)
+                result = execute_push()
+                output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
+                lowered = output.lower()
+            elif self._adopt_conflicting_kernel(session, output):
                 result = execute_push()
                 output = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
                 lowered = output.lower()
@@ -2289,6 +2490,27 @@ while True:
             return [], False, ""
         raw = clean_kaggle_output((result.stdout or "") + "\n" + (result.stderr or ""))
         if result.returncode != 0 or not raw:
+            # Kaggle CLI 2.2.4 frequently returns an empty snapshot for a live
+            # kernel even though `logs -f` has the complete stream. Sample the
+            # follow stream for a few seconds and parse the partial output.
+            try:
+                follow = self._run_kaggle(
+                    session.account_id,
+                    ["kernels", "logs", "-f", session.kernel_slug],
+                    timeout=5,
+                )
+                raw = clean_kaggle_output((follow.stdout or "") + "\n" + (follow.stderr or ""))
+            except subprocess.TimeoutExpired as exc:
+                stdout = exc.stdout or b""
+                stderr = exc.stderr or b""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode(errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                raw = clean_kaggle_output(str(stdout) + "\n" + str(stderr))
+            except Exception:
+                raw = ""
+        if not raw:
             return [], False, ""
         try:
             parsed = json.loads(raw)
@@ -2370,6 +2592,14 @@ while True:
                     session.status = "health_check"
                     session.status_detail = "Tunnel discovered; probing /v1/models."
             if remote_failure:
+                if session.accelerator == "tpu" and self._is_no_tpu_failure(remote_failure):
+                    if self._recreate_tpu_session(session, remote_failure):
+                        seen.clear()
+                        attempts = 0
+                        intentional_idle = False
+                        ready_announced = False
+                        continue
+                    return
                 self._handle_session_failure(session, remote_failure)
                 return
             if session.tunnel_url and session.status != "ready" and self._check_session_health(session):
@@ -2515,6 +2745,9 @@ while True:
     def _handle_session_failure(self, session: KernelSession, reason: str) -> None:
         if session.stop_event.is_set() and session.status == "stopped":
             return
+        if session.accelerator == "tpu" and self._is_no_tpu_failure(reason):
+            self._recreate_tpu_session(session, reason)
+            return
         session.status = "failed"
         session.last_error = reason[:800]
         session.status_detail = reason[:500]
@@ -2562,6 +2795,8 @@ while True:
             self.test_session_ids.discard(session.id)
 
     def _start_cold_failover(self, failed_account_id: Optional[str], model_id: str) -> bool:
+        if not self.auto_key_rotation:
+            return False
         if self._failover_thread and self._failover_thread.is_alive():
             return False
         self._failover_thread = threading.Thread(
@@ -2580,6 +2815,9 @@ while True:
         failed_account_id: Optional[str] = None,
     ) -> bool:
         self.log(f"[FAILOVER] {reason}")
+        if not self.auto_key_rotation:
+            self.set_status("error", f"{reason}. Automatic key switching is OFF.")
+            return False
         return self._start_cold_failover(failed_account_id, model_id or self.active_model_id)
 
     def _cold_failover_worker(self, failed_account_id: Optional[str], model_id: str) -> None:
@@ -2616,6 +2854,8 @@ while True:
             self._failover_lock.release()
 
     def start_prewarm(self, trigger_reason: str) -> Dict[str, Any]:
+        if not self.auto_key_rotation and trigger_reason != "manual":
+            return {"success": False, "error": "Automatic key switching and pre-warming are disabled"}
         active = self._active_session()
         if not active or active.status != "ready":
             return {"success": False, "error": "No healthy active session to pre-warm behind"}
@@ -2759,6 +2999,8 @@ while True:
         reset_ids = self.account_pool.refresh_weekly_quotas()
         if reset_ids:
             self.log(f"Weekly quota window reset for {len(reset_ids)} Kaggle account(s).")
+        if not self.auto_key_rotation:
+            return None
         active = self._active_session()
         if not active or active.status != "ready" or not active.tunnel_url or self._warming_session():
             return None
@@ -2791,6 +3033,7 @@ while True:
 
     def push_kernel(self, model_id: str) -> Dict[str, Any]:
         self._stop_failover.clear()
+        self.clear_recovery_state()
         if MODELS.get(model_id, {}).get("launch_supported") is False:
             return {
                 "success": False,

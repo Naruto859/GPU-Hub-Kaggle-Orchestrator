@@ -241,11 +241,11 @@ print("=" * 70 + "\n")
 
 # Step 7: Continuous Keepalive Loop with Auto-Shutdown Lifecycle
 print("[STEP 7] Entering keepalive loop with auto-shutdown lifecycle.")
-print(f"[LIFECYCLE] IDLE_TIMEOUT_MIN={{IDLE_TIMEOUT_MIN}} | MAX_RUNTIME_MIN={{MAX_RUNTIME_MIN}}")
+print(f"[LIFECYCLE] IDLE_TIMEOUT_MIN={IDLE_TIMEOUT_MIN} | MAX_RUNTIME_MIN={MAX_RUNTIME_MIN}")
 if IDLE_TIMEOUT_MIN and IDLE_TIMEOUT_MIN > 0:
-    print(f"[LIFECYCLE] Idle auto-shutdown: {{IDLE_TIMEOUT_MIN}} min without an inference request.")
+    print(f"[LIFECYCLE] Idle auto-shutdown: {IDLE_TIMEOUT_MIN} min without an inference request.")
 if MAX_RUNTIME_MIN and MAX_RUNTIME_MIN > 0:
-    print(f"[LIFECYCLE] Max runtime cap: {{MAX_RUNTIME_MIN}} min regardless of activity.")
+    print(f"[LIFECYCLE] Max runtime cap: {MAX_RUNTIME_MIN} min regardless of activity.")
 
 SESSION_START = time.time()
 
@@ -281,7 +281,7 @@ def post_shutdown_status(reason, detail):
 
 def graceful_shutdown(reason, detail):
     """Kill children, notify the manager, and END the Kaggle GPU session."""
-    print(f"[AUTO-SHUTDOWN] {{reason}}: {{detail}}")
+    print(f"[AUTO-SHUTDOWN] {reason}: {detail}")
     print("[AUTO-SHUTDOWN] Killing llama-server, cloudflared and bridge, then exiting.")
     post_shutdown_status(reason, detail)
     for proc, name in ((server_proc, "llama-server"), (cf_proc, "cloudflared"), (bridge_proc, "early_ping_bridge")):
@@ -289,14 +289,14 @@ def graceful_shutdown(reason, detail):
             if proc.poll() is None:
                 proc.terminate()
         except Exception as e:
-            print(f"[AUTO-SHUTDOWN] terminate {{name}} failed: {{e}}")
+            print(f"[AUTO-SHUTDOWN] terminate {name} failed: {e}")
     time.sleep(2)
     for proc, name in ((server_proc, "llama-server"), (cf_proc, "cloudflared"), (bridge_proc, "early_ping_bridge")):
         try:
             if proc.poll() is None:
                 proc.kill()
         except Exception as e:
-            print(f"[AUTO-SHUTDOWN] kill {{name}} failed: {{e}}")
+            print(f"[AUTO-SHUTDOWN] kill {name} failed: {e}")
     print("[AUTO-SHUTDOWN] GPU released. Kaggle session ending.")
     sys.exit(0)
 
@@ -310,7 +310,7 @@ while True:
     if MAX_RUNTIME_MIN and MAX_RUNTIME_MIN > 0:
         runtime_min = (now - SESSION_START) / 60.0
         if runtime_min >= MAX_RUNTIME_MIN:
-            graceful_shutdown("max_runtime", f"max runtime reached after {{runtime_min:.1f}} min")
+            graceful_shutdown("max_runtime", f"max runtime reached after {runtime_min:.1f} min")
 
     # --- Auto-shutdown: idle timeout (skipped while a request may be in flight) ---
     if IDLE_TIMEOUT_MIN and IDLE_TIMEOUT_MIN > 0 and bridge_ready:
@@ -318,9 +318,9 @@ while True:
         if last_activity is not None:
             idle_min = (now - last_activity) / 60.0
             if idle_min >= IDLE_TIMEOUT_MIN:
-                graceful_shutdown("idle", f"idle {{idle_min:.1f}} min, releasing GPU")
+                graceful_shutdown("idle", f"idle {idle_min:.1f} min, releasing GPU")
             elif idle_min > (IDLE_TIMEOUT_MIN / 2.0):
-                print(f"[LIFECYCLE] Idle for {{idle_min:.1f}} min of {{IDLE_TIMEOUT_MIN}} min threshold.")
+                print(f"[LIFECYCLE] Idle for {idle_min:.1f} min of {IDLE_TIMEOUT_MIN} min threshold.")
 
     # Check llama-server process health
     if server_proc.poll() is not None:
@@ -342,4 +342,4 @@ while True:
         break
 
     if tick % 4 == 0:
-        print(f"[HEARTBEAT] Elapsed: {{tick * 30}}s | Upstream {{tunnel_url}} is healthy and serving.")
+        print(f"[HEARTBEAT] Elapsed: {tick * 30}s | Upstream {tunnel_url} is healthy and serving.")

@@ -190,6 +190,22 @@ class WebshareConnector:
             self._state["auto_refresh"] = bool(enabled)
             self._save_locked()
 
+    def disconnect(self) -> Dict[str, Any]:
+        """Forget the API token and disable Webshare without touching monthly history."""
+        with self._lock:
+            self._secret = {}
+            if WEBSHARE_SECRET_PATH.exists():
+                WEBSHARE_SECRET_PATH.unlink()
+            self._health_cache.clear()
+            self._state.update({
+                "connected": False,
+                "proxies": [],
+                "last_exit_ip": "",
+                "last_error": "",
+            })
+            self._save_locked()
+        return self.public_status()
+
     def refresh_ip(self, previous_exit_ip: str = "", wait_seconds: int = 5) -> Dict[str, Any]:
         with self._lock:
             self._refresh_month_locked()

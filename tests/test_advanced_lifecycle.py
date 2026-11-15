@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -297,6 +298,128 @@ class LifecycleTests(unittest.TestCase):
             manager._prepare_account_route(ids[0])
             manager._prepare_account_route(ids[1])
             self.assertNotEqual(pool.get(ids[0])["last_exit_ip"], pool.get(ids[1])["last_exit_ip"])
+
+    def test_default_route_resolves_without_changing_account_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool, ids = make_pool(Path(directory), 1)
+            pool.update_proxy(ids[0], "default")
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            manager.default_network_route = "server"
+            self.assertEqual(manager._prepare_account_route(ids[0]), "server")
+            self.assertEqual(pool.get(ids[0])["proxy"], "default")
+
+    def test_tpu_launch_deletes_stale_slug_before_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool, ids = make_pool(root, 1)
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            manager.client_api_key = manager.upstream_api_key = "test-client-key"
+            bundle = root / "bundle"
+            bundle.mkdir()
+            (bundle / "kernel.py").write_text("print('ok')\n")
+            (bundle / "kernel-metadata.json").write_text(json.dumps({"id": "user1/glm53-tpu-serve"}))
+
+            def prepare(session):
+                session.bundle_dir = bundle
+                session.kernel_slug = "user1/glm53-tpu-serve"
+                session.kernel_title = "GLM53 TPU Serve"
+                return bundle
+
+            class Result:
+                returncode = 0
+                stdout = "Kernel version successfully pushed"
+                stderr = ""
+
+            manager._prepare_session_bundle = prepare
+            manager._monitor_session = lambda session: None
+            manager._delete_kernel_for_fresh_tpu = MagicMock()
+            manager._run_kaggle = MagicMock(return_value=Result())
+            with patch("kaggle_manager.time.sleep"):
+                result = manager._launch_session(ids[0], "glm-5.3-flash", "active")
+            self.assertTrue(result["success"])
+            manager._delete_kernel_for_fresh_tpu.assert_called_once_with(ids[0], "user1/glm53-tpu-serve")
+
+    def test_generated_gpu_kernel_has_valid_webhook_and_runtime_fstrings(self):
+        manager = km.KaggleKernelManager()
+        manager.client_api_key = manager.upstream_api_key = "test-client-key"
+        manager.webhook_host = "https://manager.example"
+        source = manager.generate_kernel_script("cybertiel-coder-35b-a3b", "session-id", "active")
+        self.assertIn('https://manager.example/api/tunnel/register', source)
+        self.assertIn('json.dumps({"tunnel_url": tunnel_url', source)
+        self.assertNotIn('json.dumps({{"tunnel_url"', source)
+        self.assertIn('IDLE_TIMEOUT_MIN={IDLE_TIMEOUT_MIN}', source)
+        compile(source, "<generated-gpu-kernel>", "exec")
+
+    def test_live_log_fallback_samples_follow_stream_for_cli_224(self):
+        manager = km.KaggleKernelManager()
+        session = km.KernelSession("gpu", "active", "account", "cybertiel-coder-35b-a3b", "gpu", kernel_slug="user/gpu-engine")
+
+        class Empty:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        timeout = subprocess.TimeoutExpired(
+            ["kaggle", "kernels", "logs", "-f"], 5,
+            output='[STEP 5] Tunnel\n[TUNNEL ESTABLISHED] URL: https://example.trycloudflare.com\n',
+            stderr="",
+        )
+        manager._run_kaggle = MagicMock(side_effect=[Empty(), timeout])
+        lines, idle, failure = manager._read_session_logs(session, set())
+        self.assertTrue(any("example.trycloudflare.com" in line for line in lines))
+        self.assertFalse(idle)
+        self.assertEqual(failure, "")
+
+    def test_no_tpu_recreates_without_cooldown_or_circuit_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool, ids = make_pool(root, 1)
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            bundle = root / "bundle"
+            bundle.mkdir()
+            (bundle / "kernel-metadata.json").write_text(json.dumps({"id": "user1/glm53-tpu-serve", "title": "GLM53 TPU Serve"}))
+            session = km.KernelSession("tpu", "active", ids[0], "glm-5.3-flash", "tpu", kernel_slug="user1/glm53-tpu-serve", kernel_title="GLM53 TPU Serve", bundle_dir=bundle)
+            session.stop_event = MagicMock()
+            session.stop_event.wait.return_value = False
+            manager.sessions = {session.id: session}
+            manager.active_session_id = session.id
+            manager.warming_session_id = session.id
+            manager._delete_kernel_for_fresh_tpu = MagicMock()
+            manager._push_existing_session_bundle = MagicMock(return_value=(True, "pushed"))
+            self.assertTrue(manager._recreate_tpu_session(session, "this session has no working TPU: jax sees 1 cpu device"))
+            self.assertEqual(session.tpu_recreate_attempts, 1)
+            self.assertEqual(session.kernel_slug, "user1/glm53-tpu-serve-r1")
+            self.assertEqual(session.status, "queued")
+            self.assertEqual(manager.consecutive_launch_failures, 0)
+            self.assertNotEqual(pool.get(ids[0])["status"], "COOLDOWN")
+
+    def test_no_tpu_retry_exhaustion_keeps_verified_account_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool, ids = make_pool(Path(directory), 1)
+            pool.activate(ids[0])
+            manager = km.KaggleKernelManager()
+            manager.account_pool = pool
+            session = km.KernelSession("tpu", "active", ids[0], "glm-5.3-flash", "tpu", kernel_slug="user1/glm53-tpu-serve", tpu_recreate_attempts=4)
+            manager.sessions = {session.id: session}
+            manager.active_session_id = session.id
+            self.assertFalse(manager._recreate_tpu_session(session, "jax sees 1 cpu device"))
+            self.assertEqual(pool.get(ids[0])["status"], "ACTIVE")
+            self.assertEqual(manager.consecutive_launch_failures, 0)
+            self.assertEqual(manager.status, "error")
+
+
+class FrontendContractTests(unittest.TestCase):
+    def test_mobile_ui_uses_no_native_select_or_browser_prompts(self):
+        html = (Path(__file__).parents[1] / "static" / "index.html").read_text()
+        self.assertNotIn("<select", html.lower())
+        self.assertNotIn("<option", html.lower())
+        self.assertNotIn("prompt(", html)
+        self.assertNotIn("alert(", html)
+        self.assertIn("AUTO-SWITCHING &AMP; NETWORK SHIELD", html.upper())
+        self.assertIn("KAGGLE API KEY POOL", html.upper())
 
 
 class ProxyQueueTests(unittest.IsolatedAsyncioTestCase):

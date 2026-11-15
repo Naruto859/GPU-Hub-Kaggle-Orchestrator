@@ -29,6 +29,8 @@ GPU Hub launches model-serving kernels on Kaggle, discovers their temporary Clou
 - **Safe cold starts:** incoming inference waits in a FIFO queue while Auto-Wake launches an accelerator. The UI and response headers expose the warm-up ETA.
 - **Webshare proxy shield:** per-account exit-IP pinning, strict proxy preflight, single-IP rotation, and no direct fallback when a protected route fails.
 - **Mobile-first control plane:** live launch phases, smooth timers, key-pool actions, custom proxy drawers, custom GGUF models, quota meters, and endpoint copy buttons.
+- **No native mobile selectors:** every dropdown is a themed custom component; Webshare and per-account routes use backdrop-blur modals instead of browser sheets, prompts, or alerts.
+- **TPU allocation self-healing:** TPU launches delete stale kernel slugs first. CPU-only `no-tpu` allocations are recreated on revisioned slugs up to four times without cooling down the account or tripping the key-pool circuit breaker.
 - **Local compatibility bridge:** the same API is also available on `127.0.0.1:8776`.
 
 ## Architecture
@@ -122,14 +124,14 @@ Create a token in **Kaggle → Settings → API**, paste only the token into the
 
 Add friends’ authorized tokens one per line in the bulk drawer. GPU Hub rotates accounts sequentially and resets locally exhausted ledgers when each rolling seven-day window expires.
 
-### 5. Add a protected network route
+### 5. Configure switching and the network shield
 
 Optional but recommended for a multi-account pool:
 
-- Paste a Webshare API token and press **Connect Webshare**.
+- Use **Auto-Switching & Network Shield** to turn 24/7 key rotation on or off and choose Server Direct, Webshare, or a custom proxy as the default route.
+- Press **Connect / Change Webshare Key** to open the secure token modal, then **Verify & Connect**.
 - Leave **Auto-Refresh IP on account switch & 15-min pre-warm** enabled.
-- On each account card, choose **Webshare Auto-Rotate**, a custom HTTP/SOCKS5 proxy, or direct server access.
-- Press **Test Proxy IP** and confirm the displayed exit address.
+- On each account card, **Custom Proxy / IP** opens a route modal with Use Default Route, Webshare, Server Direct, and custom HTTP/SOCKS5 choices.
 
 Then choose a model and press **Launch Model**. Large TPU recipes usually need 6–15 minutes; Dual T4 profiles usually need 4–5 minutes.
 
@@ -182,6 +184,8 @@ Choose an OpenAI-compatible provider and enter:
 6. A drains and its Kaggle session stops.
 7. If B fails, the circuit breaker records the failure, rotates safely, and backs off instead of hammering Kaggle.
 
+TPU recipes use an additional recovery path. GPU Hub deletes any stale TPU kernel before launch so Kaggle must create a new VM. If JAX reports a CPU-only allocation, GPU Hub keeps the same timer and account, deletes the failed slug, increments it to `-r1` through `-r4`, waits ten seconds, and re-pushes. These allocation glitches never count as invalid keys, account cooldowns, or circuit-breaker failures.
+
 With one key, GPU Hub never opens a duplicate session on the same account. It stops at the session boundary, waits a 20-second safety buffer, and restarts only when weekly quota remains.
 
 ## Webshare zero-leak proxy shield
@@ -208,6 +212,8 @@ Each account has a compact six-button grid:
 
 The lifecycle card shows pushing, provisioning, model loading, tunnel opening, elapsed time, estimated remaining time, and the 15-minute maximum ETA. You can also add a Hugging Face GGUF model through the custom-model drawer; private runtime definitions remain untracked.
 
+The standalone network card contains the persisted 24/7 rotation toggle, default route selector, Webshare status, IP refresh counter, connect/change modal, and disconnect-to-direct action. The Kaggle key card contains only credential entry and the key queue.
+
 ## Configuration and state
 
 Runtime files are created beside the application with mode `0600`. They are ignored by Git:
@@ -226,6 +232,7 @@ Copy the provided `*.example.json` files only when you need a starting template.
 | Route | Purpose |
 |---|---|
 | `GET /api/status` | Lifecycle, warm-up, model, account, queue, and Webshare status |
+| `GET/POST /api/settings` | Persist automatic rotation and the default network route |
 | `POST /api/kaggle/launch` | Launch or Auto-Wake the selected model |
 | `POST /api/kernel/stop` | Stop active, warming, and test sessions |
 | `POST /api/lifecycle/prewarm` | Manually start Tunnel B |

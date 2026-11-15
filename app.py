@@ -50,7 +50,10 @@ def load_persisted_config() -> Dict[str, Any]:
         "max_runtime_min": 540.0,
         "client_api_key": "",
         "upstream_api_key": "",
-        "auto_wake": True
+        "auto_wake": True,
+        "auto_key_rotation": True,
+        "default_network_route": "server",
+        "default_custom_proxy": "",
     }
 
 def save_persisted_config(data: Dict[str, Any]):
@@ -89,6 +92,7 @@ def save_secret_config() -> None:
 saved_conf = load_persisted_config()
 saved_secrets = load_secret_config()
 manager = KaggleKernelManager(config_callback=lambda: sync_config())
+manager.clear_recovery_state()
 manager.active_model_id = saved_conf.get("active_model_id", DEFAULT_MODEL_ID)
 manager.tunnel_url = saved_conf.get("tunnel_url", "")
 manager.tunnel_type = saved_conf.get("tunnel_type", "cloudflare")
@@ -97,6 +101,9 @@ manager.launch_time = saved_conf.get("launch_time", None)
 mock_mode = saved_conf.get("mock_mode", False)
 manager.idle_timeout_min = float(saved_conf.get("idle_timeout_min", 20.0))
 manager.max_runtime_min = float(saved_conf.get("max_runtime_min", 540.0))
+manager.auto_key_rotation = bool(saved_conf.get("auto_key_rotation", True))
+manager.default_network_route = str(saved_conf.get("default_network_route") or "server")
+manager.default_custom_proxy = str(saved_conf.get("default_custom_proxy") or "")
 if manager.max_runtime_min == 330.0:  # migrate the previous default to Kaggle's 9-hour session cap
     manager.max_runtime_min = 540.0
 client_api_key = str(saved_secrets.get("client_api_key") or saved_conf.get("client_api_key") or "").strip()
@@ -119,6 +126,9 @@ def sync_config():
         "idle_timeout_min": float(getattr(manager, "idle_timeout_min", 20.0)),
         "max_runtime_min": float(getattr(manager, "max_runtime_min", 540.0)),
         "auto_wake": auto_wake,
+        "auto_key_rotation": bool(manager.auto_key_rotation),
+        "default_network_route": manager.default_network_route,
+        "default_custom_proxy": manager.default_custom_proxy,
     })
     save_secret_config()
 
@@ -147,8 +157,46 @@ async def get_status():
     state["kaggle_key_present"] = creds.get("key_present", False)
     state["client_api_configured"] = bool(client_api_key)
     state["auto_wake"] = auto_wake
+    state["auto_key_rotation"] = bool(manager.auto_key_rotation)
+    state["default_network_route"] = manager.default_network_route
     state["webshare"] = manager.webshare.public_status()
     return state
+
+
+@app_manager.get("/api/settings")
+async def get_settings():
+    return {
+        "auto_key_rotation": bool(manager.auto_key_rotation),
+        "default_network_route": manager.default_network_route,
+        "default_custom_proxy_configured": bool(manager.default_custom_proxy),
+        "webshare_connected": manager.webshare.public_status().get("connected", False),
+    }
+
+
+@app_manager.post("/api/settings")
+async def update_settings(req: Request):
+    data = await req.json()
+    if "auto_key_rotation" in data:
+        manager.auto_key_rotation = bool(data.get("auto_key_rotation"))
+    if "default_network_route" in data:
+        route = str(data.get("default_network_route") or "server").strip().lower()
+        if route not in {"server", "webshare", "custom"}:
+            raise HTTPException(status_code=400, detail="Invalid default network route")
+        custom_url = str(data.get("custom_proxy_url") or manager.default_custom_proxy or "").strip()
+        if route == "custom":
+            if not custom_url:
+                raise HTTPException(status_code=400, detail="Custom proxy URL is required")
+            try:
+                manager._validate_proxy_choice(custom_url)
+                await asyncio.to_thread(manager.webshare.test_proxy, custom_url, True)
+            except (ValueError, ProxyRouteError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+            manager.default_custom_proxy = custom_url
+        else:
+            manager.default_custom_proxy = ""
+        manager.default_network_route = route
+    sync_config()
+    return {"success": True, **(await get_settings())}
 
 @app_manager.get("/api/client-config")
 async def get_client_config():
@@ -210,6 +258,14 @@ async def connect_webshare(req: Request):
     return {"success": True, **status}
 
 
+@app_manager.post("/api/webshare/disconnect")
+async def disconnect_webshare():
+    status = await asyncio.to_thread(manager.disconnect_webshare)
+    sync_config()
+    manager.log("Webshare disconnected; Webshare-routed accounts and the default route now use Server Direct.")
+    return {"success": True, **status, "default_network_route": "server"}
+
+
 @app_manager.post("/api/webshare/refresh")
 async def refresh_webshare_ip():
     try:
@@ -231,8 +287,10 @@ async def set_webshare_auto_refresh(req: Request):
 @app_manager.put("/api/kaggle/accounts/{account_id}/proxy")
 async def update_kaggle_account_proxy(account_id: str, req: Request):
     data = await req.json()
-    mode = str(data.get("mode") or "server").strip().lower()
-    if mode == "webshare":
+    mode = str(data.get("mode") or "default").strip().lower()
+    if mode == "default":
+        proxy = "default"
+    elif mode == "webshare":
         proxy = "webshare"
     elif mode == "custom":
         proxy = str(data.get("proxy_url") or "").strip()
@@ -267,7 +325,7 @@ async def add_kaggle_account(req: Request):
     data = await req.json()
     username = str(data.get("username") or "").strip()
     key = str(data.get("key") or "").strip()
-    proxy = str(data.get("proxy") or "server").strip() or "server"
+    proxy = str(data.get("proxy") or "default").strip() or "default"
     if not key:
         raise HTTPException(status_code=400, detail="Kaggle API key is required; username is optional")
     try:
@@ -282,7 +340,7 @@ async def add_kaggle_account(req: Request):
 async def detect_kaggle_account_username(req: Request):
     data = await req.json()
     key = str(data.get("key") or "").strip()
-    proxy = str(data.get("proxy") or "server").strip() or "server"
+    proxy = str(data.get("proxy") or "default").strip() or "default"
     if not key:
         raise HTTPException(status_code=400, detail="Kaggle API key is required")
     username = await asyncio.to_thread(manager.detect_username_for_key, key, proxy)
@@ -293,7 +351,7 @@ async def detect_kaggle_account_username(req: Request):
 @app_manager.post("/api/kaggle/accounts/bulk")
 async def bulk_add_kaggle_accounts(req: Request):
     data = await req.json()
-    entries = manager.account_pool.parse_bulk(str(data.get("text") or ""), str(data.get("proxy") or "server"))
+    entries = manager.account_pool.parse_bulk(str(data.get("text") or ""), str(data.get("proxy") or "default"))
     if not entries:
         raise HTTPException(status_code=400, detail="No valid username:key or kaggle.json entries found")
     results = await asyncio.gather(*(
@@ -355,6 +413,16 @@ async def reset_kaggle_weekly_quota(account_id: str):
     except KeyError:
         raise HTTPException(status_code=404, detail="Kaggle account not found")
     return {"success": True, "accounts": manager.account_pool.list_public()}
+
+
+@app_manager.post("/api/kaggle/accounts/{account_id}/clear-cooldown")
+async def clear_kaggle_account_cooldown(account_id: str):
+    if not manager.account_pool.get(account_id):
+        raise HTTPException(status_code=404, detail="Kaggle account not found")
+    result = manager.clear_recovery_state(account_id)
+    sync_config()
+    public = {item["id"]: item for item in manager.account_pool.list_public()}.get(account_id)
+    return {**result, "account": public}
 
 @app_manager.post("/api/kaggle/accounts/{account_id}/test-boot")
 async def test_kaggle_boot(account_id: str, req: Request):
@@ -515,7 +583,7 @@ async def update_credentials(req: Request):
     data = await req.json()
     username = str(data.get("username") or "").strip()
     key = str(data.get("key") or "").strip()
-    proxy = str(data.get("proxy") or "server").strip() or "server"
+    proxy = str(data.get("proxy") or "default").strip() or "default"
     if not key:
         raise HTTPException(status_code=400, detail="Kaggle API key is required; username is optional")
     account = await asyncio.to_thread(manager.add_kaggle_account, username, key, proxy)

@@ -135,8 +135,8 @@ class KaggleAccountPool:
 
     @staticmethod
     def _public_proxy(proxy: str) -> str:
-        if not proxy or proxy == "server":
-            return "server"
+        if not proxy or proxy in {"server", "default", "webshare"}:
+            return proxy or "server"
         try:
             parsed = urlsplit(proxy)
             if "@" not in parsed.netloc:
@@ -213,7 +213,7 @@ class KaggleAccountPool:
                 result.append({
                     "id": account["id"], "queue_position": index + 1, "username": account["username"],
                     "proxy": self._public_proxy(account["proxy"]), "status": account["status"],
-                    "proxy_mode": "webshare" if account["proxy"] == "webshare" else "server" if account["proxy"] == "server" else "custom",
+                    "proxy_mode": account["proxy"] if account["proxy"] in {"default", "webshare", "server"} else "custom",
                     "assigned_proxy": self._public_proxy(account.get("assigned_proxy_url", "")),
                     "last_exit_ip": account.get("last_exit_ip") or "",
                     "status_display": self.status_display(account["status"]), "verified": bool(account["verified_at"]),
@@ -344,6 +344,27 @@ class KaggleAccountPool:
                 "cooldown_until": time.time() + cooldown_seconds if cooldown_seconds else 0.0,
             })
             self._save_locked()
+
+    def clear_cooldown(self, account_id: Optional[str] = None) -> List[str]:
+        """Return verified accounts to a usable state without changing quota ledgers."""
+        cleared: List[str] = []
+        with self._lock:
+            for account in self._data["accounts"]:
+                if account_id and account["id"] != account_id:
+                    continue
+                if account.get("status") in {"COOLDOWN", "VERIFYING"} or account.get("cooldown_until") or account.get("last_error"):
+                    account["status"] = (
+                        "ACTIVE" if self._data.get("active_account_id") == account["id"] and account.get("verified_at")
+                        else "VERIFIED_READY" if account.get("verified_at")
+                        else "VERIFYING"
+                    )
+                    account["cooldown_until"] = 0.0
+                    account["last_error"] = ""
+                    account["updated_at"] = time.time()
+                    cleared.append(account["id"])
+            if cleared:
+                self._save_locked()
+        return cleared
 
     def reset_weekly_quota(self, account_id: str) -> Dict[str, Any]:
         with self._lock:

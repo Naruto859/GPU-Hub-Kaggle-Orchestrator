@@ -4,5 +4,8 @@
   "tunnel_type": "cloudflare",
   "idle_timeout_min": 20,
   "max_runtime_min": 540,
-  "auto_wake": true
+  "auto_wake": true,
+  "auto_key_rotation": true,
+  "default_network_route": "server",
+  "default_custom_proxy": ""
 }

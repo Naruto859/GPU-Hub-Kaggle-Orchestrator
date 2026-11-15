@@ -353,6 +353,30 @@
       border-color: var(--ok);
       box-shadow: 0 0 0 1px var(--ok);
     }
+    .custom-dropdown-item { border: 0; background: transparent; font-family: inherit; }
+    .ui-toggle {
+      width: 46px; height: 26px; border-radius: 999px; border: 1px solid var(--line-strong);
+      background: var(--surface-3); padding: 2px; transition: all .18s ease; cursor: pointer;
+    }
+    .ui-toggle span {
+      display: block; width: 20px; height: 20px; border-radius: 999px; background: var(--muted);
+      transition: transform .18s ease, background .18s ease;
+    }
+    .ui-toggle[aria-checked="true"] { background: rgba(52,211,153,.16); border-color: var(--ok); }
+    .ui-toggle[aria-checked="true"] span { transform: translateX(20px); background: var(--ok); }
+    .ui-toggle.compact { width: 40px; height: 22px; }
+    .ui-toggle.compact span { width: 16px; height: 16px; }
+    .ui-toggle.compact[aria-checked="true"] span { transform: translateX(18px); }
+    .modal-backdrop {
+      position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 16px;
+      background: rgba(2, 6, 16, .72); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    }
+    .modal-backdrop.hidden { display: none; }
+    .modal-panel {
+      width: min(100%, 460px); max-height: min(88vh, 720px); overflow-y: auto;
+      background: var(--surface); border: 1px solid var(--line-strong); border-radius: 14px;
+      box-shadow: 0 24px 70px rgba(0,0,0,.55); padding: 16px;
+    }
   </style>
 </head>
 <body class="p-3 sm:p-6 max-w-7xl mx-auto">
@@ -629,76 +653,90 @@
     <!-- Column 2: Credentials & Test Inference -->
     <div class="space-y-4">
 
-      <!-- Card: Kaggle Multi-Account Pool -->
+      <!-- Card: Auto Switching & Network Shield -->
       <section class="syn-card">
-        <div class="flex items-center justify-between mb-2.5">
-          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider flex items-center gap-1.5">
-            <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24">
-              <path d="M21 2l-2 2m-2-2l2 2m7 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"></path>
-            </svg>
-            Kaggle Key Pool &amp; Network Proxy
-          </h2>
-          <span id="credsBadge" class="pill pill-ok text-[10px]">Synced</span>
+        <div class="flex items-center justify-between mb-2.5 gap-2">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider">Auto-Switching &amp; Network Shield</h2>
+          <span id="shieldSummaryBadge" class="pill pill-neutral text-[9px]">DIRECT READY</span>
         </div>
-
         <div class="space-y-3">
-          <div class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)] space-y-2">
-            <div class="flex items-center justify-between gap-2">
-              <span class="text-[11px] font-semibold text-[var(--text)]">Webshare Anti-Ban Proxy Shield</span>
-              <span id="webshareBadge" class="pill pill-neutral text-[9px]">DISCONNECTED</span>
-            </div>
-            <div class="flex gap-2">
-              <input type="password" id="webshareToken" class="syn-input text-xs font-mono" placeholder="Webshare API token" autocomplete="off" />
-              <button onclick="connectWebshare(this)" class="syn-btn-secondary text-[10px] px-2.5 whitespace-nowrap">Connect Webshare</button>
-            </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <div class="text-[10px] font-mono bg-[var(--surface)] border border-[var(--line)] rounded p-2">
-                Exit IP: <span id="webshareExitIp" class="text-[var(--accent)]">—</span>
+          <div class="rounded-lg border border-[var(--line)] bg-[var(--surface-2)] p-2.5">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <div class="text-[11px] font-semibold text-[var(--text)]">Auto-Switch Keys &amp; 15-Min Pre-Warm (24/7 Mode)</div>
+                <p class="text-[10px] text-[var(--muted)] mt-1 leading-relaxed">When ON, GPU Hub automatically switches to the next verified Kaggle API key in your queue 15 minutes before the 9h session cap or 30h GPU / 20h TPU weekly limit expires. Works seamlessly with Server Direct or Proxy.</p>
               </div>
-              <div class="text-[10px] font-mono bg-[var(--surface)] border border-[var(--line)] rounded p-2">
-                Refreshes: <span id="webshareRefreshUsage" class="text-[var(--text)]">0 / 250 used</span>
+              <button id="autoRotationToggle" type="button" class="ui-toggle shrink-0" role="switch" aria-checked="true" onclick="toggleAutoRotation()"><span></span></button>
+            </div>
+          </div>
+
+          <div>
+            <label class="text-[11px] font-medium text-[var(--muted)] block mb-1">Default Network Route</label>
+            <div class="custom-dropdown" id="defaultRouteWrap">
+              <input type="hidden" id="defaultRouteValue" value="server" />
+              <button type="button" class="custom-dropdown-btn" onclick="toggleDropdown('defaultRouteWrap')">
+                <span id="defaultRouteLabel">Server Direct (VPS Network · No Proxy Required)</span>
+                <svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"></polyline></svg>
+              </button>
+              <div class="custom-dropdown-menu">
+                <button type="button" class="custom-dropdown-item text-left w-full" data-value="server" onclick="chooseDefaultRoute('server', 'Server Direct (VPS Network · No Proxy Required)')"><span>Server Direct (VPS Network · No Proxy Required)</span><small class="text-[10px] text-[var(--muted)]">Works normally without any proxy connection.</small></button>
+                <button type="button" class="custom-dropdown-item text-left w-full" data-value="webshare" onclick="chooseDefaultRoute('webshare', 'Webshare Auto-Rotate (Zero IP Leak)')"><span>Webshare Auto-Rotate (Zero IP Leak)</span><small class="text-[10px] text-[var(--muted)]">Uses the verified Webshare exit for Kaggle traffic.</small></button>
+                <button type="button" class="custom-dropdown-item text-left w-full" data-value="custom" onclick="chooseDefaultRoute('custom', 'Custom HTTP / SOCKS5 Proxy')"><span>Custom HTTP / SOCKS5 Proxy</span><small class="text-[10px] text-[var(--muted)]">Provide one protected route for accounts using the default.</small></button>
               </div>
             </div>
+            <div id="defaultCustomProxyRow" class="hidden mt-2 flex gap-2">
+              <input id="defaultCustomProxy" class="syn-input text-[11px] font-mono" placeholder="http://user:pass@host:port or socks5://user:pass@host:port" />
+              <button onclick="saveDefaultRoute(this)" class="syn-btn-secondary text-[10px] px-2 whitespace-nowrap">Verify &amp; Save</button>
+            </div>
+            <div id="defaultRouteNote" class="text-[10px] text-[var(--muted)] mt-1">Direct mode needs no proxy and remains fully functional.</div>
+          </div>
+
+          <div class="rounded-lg border border-[var(--line)] bg-[var(--surface-2)] p-2.5 space-y-2">
             <div class="flex items-center justify-between gap-2">
-              <label class="flex items-center gap-2 text-[10px] text-[var(--muted)] cursor-pointer leading-tight">
-                <input id="webshareAutoRefresh" type="checkbox" class="accent-cyan-400" onchange="setWebshareAutoRefresh(this.checked)" checked />
-                Auto-Refresh IP on account switch &amp; 15-min pre-warm (Zero IP Leak)
-              </label>
-              <button id="webshareRefreshBtn" onclick="refreshWebshareIp(this)" class="syn-btn-secondary py-1.5 px-2 text-[10px] whitespace-nowrap" disabled>Refresh IP Now</button>
+              <span class="text-[11px] font-semibold">Webshare Shield</span>
+              <span id="webshareBadge" class="pill pill-neutral text-[9px]">NOT CONNECTED</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px] font-mono">
+              <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-2">Exit IP: <span id="webshareExitIp" class="text-[var(--accent)]">—</span></div>
+              <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-2">Refreshes: <span id="webshareRefreshUsage">0 / 250 used</span></div>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <button onclick="openWebshareModal()" class="syn-btn-secondary py-1.5 px-2 text-[10px]">Connect / Change Webshare Key</button>
+              <button id="webshareRefreshBtn" onclick="refreshWebshareIp(this)" class="syn-btn-secondary py-1.5 px-2 text-[10px]" disabled>Refresh IP Now</button>
+            </div>
+            <div class="flex items-center justify-between gap-2 text-[10px] text-[var(--muted)]">
+              <span>Auto-refresh on account switch &amp; pre-warm</span>
+              <button id="webshareAutoRefresh" type="button" class="ui-toggle compact" role="switch" aria-checked="true" onclick="setWebshareAutoRefresh(this.getAttribute('aria-checked') !== 'true')"><span></span></button>
             </div>
             <div id="webshareError" class="hidden text-[10px] text-[var(--bad)]"></div>
           </div>
+        </div>
+      </section>
 
+      <!-- Card: Kaggle Multi-Account Pool -->
+      <section class="syn-card">
+        <div class="flex items-center justify-between mb-2.5">
+          <h2 class="text-xs uppercase font-semibold text-[var(--muted)] tracking-wider">Kaggle API Key Pool</h2>
+          <span id="credsBadge" class="pill pill-ok text-[10px]">Synced</span>
+        </div>
+        <div class="space-y-3">
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <input type="text" id="kaggleUsername" class="syn-input text-xs" placeholder="Kaggle username (optional · auto-detected)" autocomplete="off" />
-            <input type="password" id="kaggleKey" class="syn-input text-xs" placeholder="Kaggle API key / KGAT token" autocomplete="off" oninput="scheduleKaggleUsernameDetection()" />
-          </div>
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <select id="accountProxyType" class="syn-input text-xs" onchange="toggleAccountProxy()">
-              <option value="server">Server Direct (VPS network)</option>
-              <option value="webshare">Webshare Auto-Rotate (Zero Leak)</option>
-              <option value="custom">Custom HTTP / SOCKS5 proxy</option>
-            </select>
-            <input type="text" id="accountProxyUrl" class="syn-input text-xs font-mono hidden" placeholder="http://user:pass@host:port" />
+            <input type="text" id="kaggleUsername" class="syn-input text-xs" placeholder="Kaggle username (optional · auto-detected from key)" autocomplete="off" />
+            <input type="password" id="kaggleKey" class="syn-input text-xs" placeholder="Kaggle API key / personal token" autocomplete="off" oninput="scheduleKaggleUsernameDetection()" />
           </div>
           <button onclick="addKaggleAccount(this)" class="syn-btn-secondary w-full text-xs">Add Account to Queue</button>
-
           <details class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)]">
-            <summary class="text-[11px] font-medium cursor-pointer text-[var(--muted)]">Bulk paste username:key or kaggle.json</summary>
-            <textarea id="kaggleBulkInput" rows="3" class="syn-input font-mono text-[11px] mt-2 resize-y" placeholder='personal_token_one_per_line\nfriend1:legacy_key\n{"username":"friend2","key":"personal_access_token"}'></textarea>
+            <summary class="text-[11px] font-medium cursor-pointer text-[var(--muted)]">Bulk paste username:key, key-only lines, or kaggle.json</summary>
+            <textarea id="kaggleBulkInput" rows="3" class="syn-input font-mono text-[11px] mt-2 resize-y" placeholder='personal_token_one_per_line
+friend1:legacy_key
+{"username":"friend2","key":"personal_access_token"}'></textarea>
             <button onclick="bulkAddKaggleAccounts(this)" class="syn-btn-secondary w-full text-xs mt-2">Import Accounts</button>
           </details>
-
           <div>
-            <div class="flex items-center justify-between mb-1.5">
-              <span class="text-[11px] font-medium text-[var(--muted)]">Friends' Keys Queue</span>
-              <span id="accountCount" class="text-[10px] font-mono text-[var(--muted)]">0 accounts</span>
-            </div>
-            <div id="kaggleAccountsList" class="space-y-2">
-              <div class="text-[11px] text-[var(--muted)] border border-dashed border-[var(--line)] rounded-lg p-3">No saved accounts.</div>
-            </div>
+            <div class="flex items-center justify-between mb-1.5"><span class="text-[11px] font-medium text-[var(--muted)]">Friends' Keys Queue</span><span id="accountCount" class="text-[10px] font-mono text-[var(--muted)]">0 accounts</span></div>
+            <div id="kaggleAccountsList" class="space-y-2"><div class="text-[11px] text-[var(--muted)] border border-dashed border-[var(--line)] rounded-lg p-3">No saved accounts.</div></div>
           </div>
-          <p class="text-[10px] text-[var(--muted)] leading-relaxed">Keys are verified immediately. GPU Hub pre-warms the next VERIFIED · READY account 15 minutes before a session or weekly quota limit, swaps tunnels atomically, and resets exhausted weekly ledgers after seven days.</p>
+          <p class="text-[10px] text-[var(--muted)] leading-relaxed">Keys are verified immediately and use the Default Network Route unless you override an individual account.</p>
         </div>
       </section>
 
@@ -803,6 +841,44 @@
     </div>
   </footer>
 
+  <div id="webshareModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="webshareModalTitle" onclick="if(event.target === this) closeModal('webshareModal')">
+    <div class="modal-panel space-y-3">
+      <div class="flex items-center justify-between gap-2">
+        <div><h3 id="webshareModalTitle" class="text-sm font-semibold">Connect Webshare Shield</h3><p class="text-[10px] text-[var(--muted)] mt-1">The token is stored locally with mode 0600 and never appears in account cards.</p></div>
+        <button onclick="closeModal('webshareModal')" class="syn-btn-secondary px-2 py-1 text-xs" aria-label="Close">✕</button>
+      </div>
+      <input type="password" id="webshareToken" class="syn-input text-xs font-mono" placeholder="Paste Webshare API token" autocomplete="off" />
+      <div id="webshareModalResult" class="text-[10px] text-[var(--muted)]">GPU Hub will verify the API key and proxy exit IP before saving.</div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <button onclick="connectWebshare(this)" class="syn-btn-primary text-xs">Verify &amp; Connect</button>
+        <button onclick="disconnectWebshare(this)" class="syn-btn-stop text-xs">Disconnect / Use Server Direct</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="accountProxyModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="accountProxyModalTitle" onclick="if(event.target === this) closeModal('accountProxyModal')">
+    <div class="modal-panel space-y-3">
+      <div class="flex items-center justify-between gap-2">
+        <div><h3 id="accountProxyModalTitle" class="text-sm font-semibold">Account Network Route</h3><p id="accountProxyModalAccount" class="text-[10px] text-[var(--muted)] mt-1"></p></div>
+        <button onclick="closeModal('accountProxyModal')" class="syn-btn-secondary px-2 py-1 text-xs" aria-label="Close">✕</button>
+      </div>
+      <input type="hidden" id="accountProxyModalId" />
+      <div class="custom-dropdown" id="accountRouteWrap">
+        <input type="hidden" id="accountRouteValue" value="default" />
+        <button type="button" class="custom-dropdown-btn" onclick="toggleDropdown('accountRouteWrap')"><span id="accountRouteLabel">Use Default Route</span><svg class="w-4 h-4 stroke-current" fill="none" stroke-width="2" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"></polyline></svg></button>
+        <div class="custom-dropdown-menu">
+          <button type="button" class="custom-dropdown-item text-left w-full" onclick="chooseAccountRoute('default', 'Use Default Route')">Use Default Route</button>
+          <button type="button" class="custom-dropdown-item text-left w-full" onclick="chooseAccountRoute('webshare', 'Webshare Auto-Rotate')">Webshare Auto-Rotate</button>
+          <button type="button" class="custom-dropdown-item text-left w-full" onclick="chooseAccountRoute('server', 'Server Direct')">Server Direct</button>
+          <button type="button" class="custom-dropdown-item text-left w-full" onclick="chooseAccountRoute('custom', 'Custom HTTP / SOCKS5 Proxy')">Custom HTTP / SOCKS5 Proxy</button>
+        </div>
+      </div>
+      <input id="accountProxyModalUrl" class="syn-input text-xs font-mono hidden" placeholder="http://user:pass@host:port or socks5://user:pass@host:port" />
+      <div id="accountProxyModalResult" class="text-[10px] text-[var(--muted)]">Choose a route, then verify and save.</div>
+      <button onclick="saveAccountProxyFromModal(this)" class="syn-btn-primary w-full text-xs">Verify &amp; Save</button>
+    </div>
+  </div>
+
   <!-- Script logic -->
   <script>
     // ── Global State & Timer ────────────────────────────────────
@@ -814,6 +890,7 @@
     let currentSelectedModelId = '';
     let currentWarmup = null;
     let usernameDetectTimer = null;
+    let hubSettings = {auto_key_rotation: true, default_network_route: 'server'};
 
     function formatElapsed(totalSec) {
       if (totalSec < 0) totalSec = 0;
@@ -874,7 +951,8 @@
         queued: '2/4 Kaggle Provisioning',
         booting: '3/4 Loading Model Weights', loading_model: '3/4 Loading Model Weights',
         health_check: '4/4 Opening Cloudflare Tunnel & Health Check', eta_warning: '4/4 Opening Cloudflare Tunnel & Health Check',
-        cooldown: 'Safety Cooldown Before Same-Key Restart'
+        cooldown: 'Safety Cooldown Before Same-Key Restart',
+        recreating_tpu: '2/4 Re-Creating Fresh Kaggle TPU VM'
       };
       document.getElementById('lifecycleWarmupPhase').innerText = phases[currentWarmup.status] || '2/4 Kaggle Provisioning';
       document.getElementById('lifecycleWarmupTime').innerText = `Elapsed: ${shortTime(elapsed)} | Est. Remaining: ~${shortTime(remaining)} (Max 15m)`;
@@ -919,6 +997,28 @@
       }
     });
 
+    function setToggleState(id, enabled) {
+      const toggle = document.getElementById(id);
+      if (toggle) toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    }
+
+    function openModal(id) {
+      document.getElementById(id)?.classList.remove('hidden');
+      document.body.style.overflow = 'hidden';
+    }
+
+    function closeModal(id) {
+      document.getElementById(id)?.classList.add('hidden');
+      document.body.style.overflow = '';
+    }
+
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        document.querySelectorAll('.modal-backdrop').forEach(modal => modal.classList.add('hidden'));
+        document.body.style.overflow = '';
+      }
+    });
+
     function selectModelOption(id, name) {
       currentSelectedModelId = id;
       document.getElementById('modelSelectVal').value = id;
@@ -941,9 +1041,69 @@
       });
     }
 
-    function toggleAccountProxy() {
-      const custom = document.getElementById('accountProxyType').value === 'custom';
-      document.getElementById('accountProxyUrl').classList.toggle('hidden', !custom);
+    function routeLabel(route) {
+      return {
+        server: 'Server Direct (VPS Network · No Proxy Required)',
+        webshare: 'Webshare Auto-Rotate (Zero IP Leak)',
+        custom: 'Custom HTTP / SOCKS5 Proxy',
+      }[route] || 'Server Direct (VPS Network · No Proxy Required)';
+    }
+
+    function chooseDefaultRoute(value, label) {
+      document.getElementById('defaultRouteValue').value = value;
+      document.getElementById('defaultRouteLabel').innerText = label;
+      document.getElementById('defaultRouteWrap').classList.remove('open');
+      document.getElementById('defaultCustomProxyRow').classList.toggle('hidden', value !== 'custom');
+      if (value !== 'custom') saveDefaultRoute();
+    }
+
+    async function loadSettings() {
+      try {
+        const response = await fetch('/api/settings');
+        hubSettings = await response.json();
+        setToggleState('autoRotationToggle', hubSettings.auto_key_rotation !== false);
+        const route = hubSettings.default_network_route || 'server';
+        document.getElementById('defaultRouteValue').value = route;
+        document.getElementById('defaultRouteLabel').innerText = routeLabel(route);
+        document.getElementById('defaultCustomProxyRow').classList.toggle('hidden', route !== 'custom');
+      } catch (error) {
+        console.error('Settings load failed:', error);
+      }
+    }
+
+    async function toggleAutoRotation() {
+      const enabled = document.getElementById('autoRotationToggle').getAttribute('aria-checked') !== 'true';
+      setToggleState('autoRotationToggle', enabled);
+      const response = await fetch('/api/settings', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({auto_key_rotation: enabled})
+      });
+      const data = await response.json();
+      if (!response.ok) setToggleState('autoRotationToggle', !enabled);
+      else hubSettings = data;
+    }
+
+    async function saveDefaultRoute(button) {
+      const route = document.getElementById('defaultRouteValue').value;
+      const customProxy = document.getElementById('defaultCustomProxy').value.trim();
+      const note = document.getElementById('defaultRouteNote');
+      if (button) { button.disabled = true; button.innerText = 'Verifying...'; }
+      try {
+        const response = await fetch('/api/settings', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({default_network_route: route, custom_proxy_url: customProxy})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Route save failed');
+        hubSettings = data;
+        note.innerText = route === 'server' ? 'Direct mode saved. No proxy is required.' : `${routeLabel(route)} saved as the default route.`;
+        note.className = 'text-[10px] text-[var(--ok)] mt-1';
+        if (route === 'custom') document.getElementById('defaultCustomProxy').value = '';
+      } catch (error) {
+        note.innerText = String(error.message || error);
+        note.className = 'text-[10px] text-[var(--bad)] mt-1';
+      } finally {
+        if (button) { button.disabled = false; button.innerText = 'Verify & Save'; }
+      }
     }
 
     async function copyField(id, button) {
@@ -1447,25 +1607,21 @@
         list.innerHTML = '<div class="text-[11px] text-[var(--muted)] border border-dashed border-[var(--line)] rounded-lg p-3">No saved accounts.</div>';
         return;
       }
-      list.innerHTML = accounts.map(account => `
+      list.innerHTML = accounts.map(account => {
+        const needsRecovery = account.status === 'COOLDOWN' || activeState?.status === 'quota_wait' || /no working tpu|jax sees 1 cpu/i.test(account.last_error || '');
+        return `
         <div class="border border-[var(--line)] rounded-lg p-2.5 bg-[var(--surface-2)]">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">
               <div class="text-xs font-semibold truncate">${escapeHtml(account.username)}</div>
-              <div class="text-[10px] font-mono text-[var(--muted)] truncate">${escapeHtml(account.key_hint || 'Key present')} · ${escapeHtml(account.proxy || 'server')}</div>
+              <div class="text-[10px] font-mono text-[var(--muted)] truncate">${escapeHtml(account.key_hint || 'Key present')} · ${escapeHtml(account.proxy || 'default')}</div>
               <div class="text-[10px] font-mono text-[var(--muted)] truncate">Exit IP: <span class="text-[var(--accent)]">${escapeHtml(account.last_exit_ip || 'not verified')}</span></div>
             </div>
             <span class="pill ${accountStatusClass(account.status)} text-[9px] shrink-0">${escapeHtml(account.status_display || account.status)}</span>
           </div>
           <div class="grid grid-cols-2 gap-1.5 mt-2 text-[10px] font-mono">
-            <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-1.5">
-              <div class="text-[var(--muted)]">GPU WEEK</div>
-              <div class="text-[var(--text)]">${Number(account.gpu_quota?.used_hours || 0).toFixed(2)}h / ${account.gpu_quota?.limit_hours || 30}h</div>
-            </div>
-            <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-1.5">
-              <div class="text-[var(--muted)]">TPU WEEK</div>
-              <div class="text-[var(--text)]">${Number(account.tpu_quota?.used_hours || 0).toFixed(2)}h / ${account.tpu_quota?.limit_hours || 20}h</div>
-            </div>
+            <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-1.5"><div class="text-[var(--muted)]">GPU WEEK</div><div class="text-[var(--text)]">${Number(account.gpu_quota?.used_hours || 0).toFixed(2)}h / ${account.gpu_quota?.limit_hours || 30}h</div></div>
+            <div class="bg-[var(--surface)] border border-[var(--line)] rounded p-1.5"><div class="text-[var(--muted)]">TPU WEEK</div><div class="text-[var(--text)]">${Number(account.tpu_quota?.used_hours || 0).toFixed(2)}h / ${account.tpu_quota?.limit_hours || 20}h</div></div>
           </div>
           ${(account.gpu_quota?.reset_at || account.tpu_quota?.reset_at) ? `<div class="text-[10px] text-[var(--muted)] mt-1">Weekly reset: <span class="font-mono">${new Date((account.gpu_quota?.reset_at || account.tpu_quota?.reset_at) * 1000).toLocaleString()}</span></div>` : '<div class="text-[10px] text-[var(--muted)] mt-1">Weekly window starts with the next session.</div>'}
           <div class="text-[10px] text-[var(--muted)] mt-1">Boot ETA: GPU <span class="font-mono text-[var(--accent)]">~${shortTime(account.boot_estimate_gpu_seconds)}</span> · TPU <span class="font-mono text-[var(--accent)]">~${shortTime(account.boot_estimate_tpu_seconds)}</span>${account.last_boot_seconds ? ` · Last ${shortTime(account.last_boot_seconds)}` : ''}</div>
@@ -1475,35 +1631,25 @@
             <button onclick="verifyKaggleAccount('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]">Verify Key</button>
             <button onclick="testKaggleBoot('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]" ${!account.verified || ['PREWARMING','TESTING_BOOT'].includes(account.status) ? 'disabled' : ''}>Test &amp; Measure Boot</button>
             <button onclick="resetWeeklyQuota('${account.id}', this)" class="syn-btn-secondary py-1 text-[10px]">Reset Weekly Quota</button>
-            <button onclick="toggleAccountProxyDrawer('${account.id}')" class="syn-btn-secondary py-1 text-[10px]">Custom Proxy / IP</button>
+            <button onclick="openAccountProxyModal('${account.id}', '${escapeHtml(account.username)}', '${account.proxy_mode || 'default'}')" class="syn-btn-secondary py-1 text-[10px]">Custom Proxy / IP</button>
             <button onclick="deleteKaggleAccount('${account.id}', this)" class="syn-btn-stop py-1 px-2 text-[10px]">Delete</button>
           </div>
-          <div id="proxyDrawer-${account.id}" class="hidden mt-2 border border-[var(--line)] rounded-lg p-2 bg-[var(--surface)] space-y-2">
-            <select id="proxyMode-${account.id}" class="syn-input text-[11px]" onchange="toggleAccountProxyFields('${account.id}')">
-              <option value="webshare" ${account.proxy_mode === 'webshare' ? 'selected' : ''}>Webshare Auto-Rotate (Zero Leak)</option>
-              <option value="custom" ${account.proxy_mode === 'custom' ? 'selected' : ''}>Custom Proxy URL</option>
-              <option value="server" ${account.proxy_mode === 'server' ? 'selected' : ''}>Server Direct (VPS IP - Single Account Only)</option>
-            </select>
-            <input id="proxyUrl-${account.id}" class="syn-input text-[11px] font-mono ${account.proxy_mode === 'custom' ? '' : 'hidden'}" placeholder="http://user:pass@ip:port or socks5://user:pass@ip:port" />
-            <div class="grid grid-cols-2 gap-1.5">
-              <button onclick="saveAccountProxy('${account.id}', this)" class="syn-btn-secondary py-1.5 text-[10px]">Save Route</button>
-              <button onclick="testAccountProxy('${account.id}', this)" class="syn-btn-secondary py-1.5 text-[10px]">Test Proxy IP</button>
-            </div>
-            <div id="proxyResult-${account.id}" class="text-[10px] font-mono text-[var(--muted)]">Current: ${escapeHtml(account.proxy || 'server')} · ${escapeHtml(account.last_exit_ip || 'not tested')}</div>
-          </div>
-        </div>
-      `).join('');
+          ${needsRecovery ? `<button onclick="clearCooldown('${account.id}', this)" class="syn-btn-secondary w-full py-1.5 text-[10px] mt-2 border-amber-400/40 text-[var(--warn)]">Clear Cooldown / Retry Now</button>` : ''}
+        </div>`;
+      }).join('');
     }
 
     function renderWebshareStatus(status) {
       webshareState = status || webshareState;
       const connected = Boolean(webshareState.connected);
       const badge = document.getElementById('webshareBadge');
-      badge.innerText = connected ? 'CONNECTED' : 'DISCONNECTED';
+      badge.innerText = connected ? 'CONNECTED' : 'NOT CONNECTED';
       badge.className = `pill ${connected ? 'pill-ok' : 'pill-neutral'} text-[9px]`;
+      document.getElementById('shieldSummaryBadge').innerText = connected ? 'SHIELD CONNECTED' : 'DIRECT READY';
+      document.getElementById('shieldSummaryBadge').className = `pill ${connected ? 'pill-ok' : 'pill-info'} text-[9px]`;
       document.getElementById('webshareExitIp').innerText = webshareState.exit_ip || '—';
       document.getElementById('webshareRefreshUsage').innerText = `${webshareState.refreshes_used || 0} / ${webshareState.refresh_limit || 250} used`;
-      document.getElementById('webshareAutoRefresh').checked = webshareState.auto_refresh !== false;
+      setToggleState('webshareAutoRefresh', webshareState.auto_refresh !== false);
       document.getElementById('webshareAutoRefresh').disabled = !connected;
       document.getElementById('webshareRefreshBtn').disabled = !connected;
       const error = document.getElementById('webshareError');
@@ -1522,18 +1668,19 @@
       }
     }
 
-    function selectedAccountProxy() {
-      if (document.getElementById('accountProxyType').value === 'webshare') return 'webshare';
-      if (document.getElementById('accountProxyType').value !== 'custom') return 'server';
-      return document.getElementById('accountProxyUrl').value.trim() || 'server';
+    function openWebshareModal() {
+      document.getElementById('webshareModalResult').innerText = webshareState.connected ? 'Paste a new token to replace the current Webshare connection.' : 'GPU Hub will verify the token and exit IP before saving.';
+      openModal('webshareModal');
+      setTimeout(() => document.getElementById('webshareToken').focus(), 50);
     }
 
     async function connectWebshare(button) {
       const token = document.getElementById('webshareToken').value.trim();
-      if (!token) return;
+      const result = document.getElementById('webshareModalResult');
+      if (!token) { result.innerText = 'Paste a Webshare API token first.'; result.className = 'text-[10px] text-[var(--bad)]'; return; }
       const original = button.innerText;
       button.disabled = true;
-      button.innerText = 'Connecting...';
+      button.innerText = 'Verifying...';
       try {
         const response = await fetch('/api/webshare/connect', {
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token})
@@ -1542,12 +1689,36 @@
         if (!response.ok) throw new Error(data.detail || 'Webshare connection failed');
         document.getElementById('webshareToken').value = '';
         renderWebshareStatus(data);
-        button.innerText = 'Connected';
+        result.innerText = `Connected · Exit IP ${data.exit_ip || 'verified'}`;
+        result.className = 'text-[10px] text-[var(--ok)]';
+        setTimeout(() => closeModal('webshareModal'), 650);
       } catch (error) {
-        renderWebshareStatus({...webshareState, connected: false, last_error: String(error.message || error)});
-        button.innerText = 'Connect Failed';
+        result.innerText = String(error.message || error);
+        result.className = 'text-[10px] text-[var(--bad)]';
       } finally {
-        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1600);
+        button.innerText = original;
+        button.disabled = false;
+      }
+    }
+
+    async function disconnectWebshare(button) {
+      const result = document.getElementById('webshareModalResult');
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/webshare/disconnect', {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Disconnect failed');
+        renderWebshareStatus(data);
+        chooseDefaultRoute('server', routeLabel('server'));
+        result.innerText = 'Webshare disconnected. Server Direct is active.';
+        result.className = 'text-[10px] text-[var(--ok)]';
+        await loadKaggleAccounts();
+        setTimeout(() => closeModal('webshareModal'), 650);
+      } catch (error) {
+        result.innerText = String(error.message || error);
+        result.className = 'text-[10px] text-[var(--bad)]';
+      } finally {
+        button.disabled = false;
       }
     }
 
@@ -1570,6 +1741,7 @@
     }
 
     async function setWebshareAutoRefresh(enabled) {
+      setToggleState('webshareAutoRefresh', enabled);
       try {
         const response = await fetch('/api/webshare/auto-refresh', {
           method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})
@@ -1578,56 +1750,74 @@
         if (!response.ok) throw new Error(data.detail || 'Update failed');
         renderWebshareStatus(data);
       } catch (error) {
+        setToggleState('webshareAutoRefresh', !enabled);
         renderWebshareStatus({...webshareState, last_error: String(error.message || error)});
       }
     }
 
-    function toggleAccountProxyDrawer(id) {
-      document.getElementById(`proxyDrawer-${id}`).classList.toggle('hidden');
+    function accountRouteLabel(mode) {
+      return {default: 'Use Default Route', webshare: 'Webshare Auto-Rotate', server: 'Server Direct', custom: 'Custom HTTP / SOCKS5 Proxy'}[mode] || 'Use Default Route';
     }
 
-    function toggleAccountProxyFields(id) {
-      const custom = document.getElementById(`proxyMode-${id}`).value === 'custom';
-      document.getElementById(`proxyUrl-${id}`).classList.toggle('hidden', !custom);
+    function openAccountProxyModal(id, username, mode) {
+      document.getElementById('accountProxyModalId').value = id;
+      document.getElementById('accountProxyModalAccount').innerText = username;
+      document.getElementById('accountRouteValue').value = mode || 'default';
+      document.getElementById('accountRouteLabel').innerText = accountRouteLabel(mode || 'default');
+      document.getElementById('accountProxyModalUrl').value = '';
+      document.getElementById('accountProxyModalUrl').classList.toggle('hidden', mode !== 'custom');
+      document.getElementById('accountProxyModalResult').innerText = 'Choose a route, then verify and save.';
+      document.getElementById('accountProxyModalResult').className = 'text-[10px] text-[var(--muted)]';
+      openModal('accountProxyModal');
     }
 
-    async function saveAccountProxy(id, button) {
-      const mode = document.getElementById(`proxyMode-${id}`).value;
-      const proxyUrl = document.getElementById(`proxyUrl-${id}`).value.trim();
-      const result = document.getElementById(`proxyResult-${id}`);
+    function chooseAccountRoute(value, label) {
+      document.getElementById('accountRouteValue').value = value;
+      document.getElementById('accountRouteLabel').innerText = label;
+      document.getElementById('accountRouteWrap').classList.remove('open');
+      document.getElementById('accountProxyModalUrl').classList.toggle('hidden', value !== 'custom');
+    }
+
+    async function saveAccountProxyFromModal(button) {
+      const id = document.getElementById('accountProxyModalId').value;
+      const mode = document.getElementById('accountRouteValue').value;
+      const proxyUrl = document.getElementById('accountProxyModalUrl').value.trim();
+      const result = document.getElementById('accountProxyModalResult');
       button.disabled = true;
+      button.innerText = 'Verifying...';
       try {
         const response = await fetch(`/api/kaggle/accounts/${id}/proxy`, {
           method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode, proxy_url: proxyUrl})
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || 'Route save failed');
-        result.innerText = `Saved · Exit IP ${data.account?.last_exit_ip || 'not tested'}`;
+        result.innerText = `Saved · Exit IP ${data.account?.last_exit_ip || 'Server Direct / inherited default'}`;
+        result.className = 'text-[10px] text-[var(--ok)]';
         await loadKaggleAccounts();
+        setTimeout(() => closeModal('accountProxyModal'), 650);
       } catch (error) {
         result.innerText = String(error.message || error);
-        result.className = 'text-[10px] font-mono text-[var(--bad)]';
+        result.className = 'text-[10px] text-[var(--bad)]';
       } finally {
         button.disabled = false;
+        button.innerText = 'Verify & Save';
       }
     }
 
-    async function testAccountProxy(id, button) {
-      const result = document.getElementById(`proxyResult-${id}`);
+    async function clearCooldown(id, button) {
+      const original = button.innerText;
       button.disabled = true;
-      button.innerText = 'Testing...';
+      button.innerText = 'Clearing...';
       try {
-        const response = await fetch(`/api/kaggle/accounts/${id}/proxy/test`, {method: 'POST'});
+        const response = await fetch(`/api/kaggle/accounts/${id}/clear-cooldown`, {method: 'POST'});
         const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || 'Proxy test failed');
-        result.innerText = `${data.mode} exit IP: ${data.exit_ip}`;
-        result.className = 'text-[10px] font-mono text-[var(--ok)]';
+        if (!response.ok) throw new Error(data.detail || 'Recovery failed');
+        button.innerText = 'Ready to Retry';
+        await Promise.all([loadKaggleAccounts(), fetchStatus()]);
       } catch (error) {
-        result.innerText = String(error.message || error);
-        result.className = 'text-[10px] font-mono text-[var(--bad)]';
+        button.innerText = 'Retry Failed';
       } finally {
-        button.innerText = 'Test Proxy IP';
-        button.disabled = false;
+        setTimeout(() => { button.innerText = original; button.disabled = false; }, 1400);
       }
     }
 
@@ -1642,7 +1832,7 @@
         try {
           const response = await fetch('/api/kaggle/detect-username', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({key, proxy: selectedAccountProxy()})
+            body: JSON.stringify({key, proxy: 'default'})
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.detail || 'Detection failed');
@@ -1660,7 +1850,6 @@
       const username = document.getElementById('kaggleUsername').value.trim();
       const key = document.getElementById('kaggleKey').value.trim();
       if (!key) return;
-      const proxy = selectedAccountProxy();
       const badge = document.getElementById('credsBadge');
       badge.innerText = 'Adding...';
       badge.className = 'pill pill-warn text-[10px]';
@@ -1669,7 +1858,7 @@
         const res = await fetch('/api/kaggle/accounts', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({username, key, proxy})
+          body: JSON.stringify({username, key})
         });
         const d = await res.json();
         if (!res.ok) throw new Error(d.detail || 'Add failed');
@@ -1695,7 +1884,7 @@
       try {
         const response = await fetch('/api/kaggle/accounts/bulk', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({text, proxy: selectedAccountProxy()})
+          body: JSON.stringify({text})
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || 'Import failed');
@@ -1846,6 +2035,7 @@
 
     // Init
     loadClientConfig();
+    loadSettings();
     loadKaggleAccounts();
     fetchStatus();
     setInterval(fetchStatus, 3000);
